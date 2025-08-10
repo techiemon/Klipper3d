@@ -63,11 +63,17 @@ class Max6675Heater:
         self._pid = PID(self.pid_kp, self.pid_ki, self.pid_kd, setpoint=0)
         self._dht22_temp = None
         self._element_temp = None
+        self._dht22_humidity = None
+        self._log_entries = []  # List of (timestamp, avg_power, avg_air, avg_elem, avg_hum)
+        self._log_accum = {'power': [], 'air': [], 'elem': [], 'hum': []}
+        self._last_log_time = time.time()
         self._running = True
         self._control_thread = threading.Thread(target=self._control_loop, daemon=True)
         self._dht22_thread = threading.Thread(target=self._dht22_loop, daemon=True)
+        self._log_thread = threading.Thread(target=self._log_loop, daemon=True)
         self._control_thread.start()
         self._dht22_thread.start()
+        self._log_thread.start()
 
     def _register_gcodes(self):
         self.printer.register_event_handler('gcode:SET_HEATER_TEMP', self.cmd_SET_HEATER_TEMP)
@@ -82,12 +88,15 @@ class Max6675Heater:
 
     def _dht22_loop(self):
         if Adafruit_DHT is None:
-            self._log.warning('Adafruit_DHT not installed, DHT22 not available')
+            self._log.warning('Adafruit_DHT not installed, DHT22/AM2302 not available')
             return
         while self._running:
             humidity, temp = Adafruit_DHT.read_retry(Adafruit_DHT.DHT22, self.dht22_pin)
             if temp is not None:
                 self._dht22_temp = temp
+            if humidity is not None:
+                self._dht22_humidity = humidity
+                self._log_accum['hum'].append(humidity)
             time.sleep(self.dht22_interval)
 
     def _control_loop(self):
@@ -110,13 +119,20 @@ class Max6675Heater:
     def set_power(self, power):
         power = max(0.0, min(1.0, power))
         self.heater_power = power
+        # Accumulate for logging
+        self._log_accum['power'].append(power)
         pwm_value = int(power * 65535)
         self._send_ssr_pwm_set(pwm_value)
     def get_air_temp(self):
-        return self._dht22_temp
+        val = self._dht22_temp
+        if val is not None:
+            self._log_accum['air'].append(val)
+        return val
     def get_element_temp(self):
         temp = self._send_max6675_read()
         self._element_temp = temp
+        if temp is not None:
+            self._log_accum['elem'].append(temp)
         return temp
     def _send_max6675_read(self):
         resp = self.mcu.send('max6675_read')
@@ -140,8 +156,11 @@ class Max6675Heater:
         if power is not None:
             self.set_power(power)
     def cmd_QUERY_HEATER(self, gcmd):
-        gcmd.respond_info('Air temp: %.2fC, Element temp: %.2fC, Power: %.2f%%' % (
-            self.get_air_temp() or -999, self.get_element_temp() or -999, self.heater_power * 100.0))
+        air_temp = self.get_air_temp() or -999
+        element_temp = self.get_element_temp() or -999
+        humidity = self._dht22_humidity if hasattr(self, '_dht22_humidity') and self._dht22_humidity is not None else -999
+        gcmd.respond_info('Air temp: %.2fC, Humidity: %.1f%%, Element temp: %.2fC, Power: %.2f%%' % (
+            air_temp, humidity, element_temp, self.heater_power * 100.0))
     def cmd_TUNE_HEATER_PID(self, gcmd):
         kp = gcmd.get_float('KP', None)
         ki = gcmd.get_float('KI', None)
@@ -150,6 +169,33 @@ class Max6675Heater:
         if ki is not None: self._pid.ki = ki
         if kd is not None: self._pid.kd = kd
         gcmd.respond_info('PID updated: Kp=%.3f Ki=%.3f Kd=%.3f' % (self._pid.kp, self._pid.ki, self._pid.kd))
+
+    def _log_loop(self):
+        while self._running:
+            now = time.time()
+            # Log every 60 seconds
+            if now - self._last_log_time >= 60:
+                avg = lambda arr: sum(arr)/len(arr) if arr else None
+                entry = (
+                    int(now),
+                    avg(self._log_accum['power']),
+                    avg(self._log_accum['air']),
+                    avg(self._log_accum['elem']),
+                    avg(self._log_accum['hum'])
+                )
+                self._log_entries.append(entry)
+                # Reset accumulators
+                for k in self._log_accum:
+                    self._log_accum[k].clear()
+                self._last_log_time = now
+            time.sleep(5)
+
+    def cmd_EXPORT_HEATER_LOG(self, gcmd):
+        lines = ["timestamp,avg_power,avg_air,avg_element,avg_humidity"]
+        for entry in self._log_entries:
+            ts, power, air, elem, hum = entry
+            lines.append(f"{ts},{power:.3f},{air:.2f},{elem:.2f},{hum:.1f}")
+        gcmd.respond_info("\n".join(lines))
 
 def load_config(config):
     return Max6675Heater(config)
