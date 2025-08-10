@@ -75,6 +75,12 @@ class Max6675Heater:
         self._control_thread.start()
         self._dht22_thread.start()
         self._log_thread.start()
+        # Register event handlers for print stop/cancel/complete
+        self.printer.register_event_handler('idle_timeout:printing', self._on_print_start)
+        self.printer.register_event_handler('idle_timeout:idle', self._on_print_stop)
+        self.printer.register_event_handler('gcode:PRINT_END', self._on_print_stop)
+        self.printer.register_event_handler('gcode:PRINT_CANCEL', self._on_print_stop)
+        self.printer.register_event_handler('gcode:PRINT_ABORT', self._on_print_stop)
 
     def _register_gcodes(self):
         self.printer.register_event_handler('gcode:SET_HEATER_TEMP', self.cmd_SET_HEATER_TEMP)
@@ -109,6 +115,7 @@ class Max6675Heater:
         last_elem_time = None
         sensor_fail_timeout = 10  # seconds
         last_elem_ok = time.time()
+        self._heater_enabled = True
         while self._running:
             now = time.time()
             air_temp = self.get_air_temp()
@@ -151,6 +158,9 @@ class Max6675Heater:
 
     def set_power(self, power):
         power = max(0.0, min(1.0, power))
+        # Only allow heating if enabled
+        if not getattr(self, '_heater_enabled', True):
+            power = 0.0
         self.heater_power = power
         # Accumulate for logging
         self._log_accum['power'].append(power)
@@ -184,6 +194,8 @@ class Max6675Heater:
         temp = gcmd.get_float('S', None)
         if temp is not None:
             self.target_air = temp
+            self._heater_enabled = True
+            gcmd.respond_info('Target air temperature set to %.2fC' % temp)
     def cmd_SET_HEATER_POWER(self, gcmd):
         power = gcmd.get_float('S', None)
         if power is not None:
@@ -240,6 +252,13 @@ class Max6675Heater:
         self._error = reason
         self._running = False
         self._log.warning('Heater shutdown: %s', reason)
+
+    def _on_print_stop(self, *args, **kwargs):
+        self._heater_enabled = False
+        self.set_power(0.0)
+    def _on_print_start(self, *args, **kwargs):
+        # Optionally: self._heater_enabled = True  # Only if you want auto-resume
+        pass
 
 def load_config(config):
     return Max6675Heater(config)
