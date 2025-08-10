@@ -41,7 +41,7 @@ class PID:
 class Max6675Heater:
     def __init__(self, config):
         self.printer = config.get_printer()
-        self.mcu = config.getsection('mcu ' + config.get('mcu', 'mcu'))
+        self.mcu = self.printer.lookup_object(config.get('mcu'))
         self.name = config.get_name().split()[1]
         self.cs_pin = config.get('cs_pin')
         self.ssr_pin = config.get('ssr_pin')
@@ -64,6 +64,7 @@ class Max6675Heater:
         self._dht22_temp = None
         self._element_temp = None
         self._dht22_humidity = None
+        self._error = None
         self._log_entries = []  # List of (timestamp, avg_power, avg_air, avg_elem, avg_hum)
         self._log_accum = {'power': [], 'air': [], 'elem': [], 'hum': []}
         self._last_log_time = time.time()
@@ -100,20 +101,52 @@ class Max6675Heater:
             time.sleep(self.dht22_interval)
 
     def _control_loop(self):
+        throttle_temp = 220.0  # Celsius (throttle, not shutdown)
+        shutdown_temp = 260.0  # Celsius (shutdown)
+        runaway_rate = 5.0     # degC/sec, threshold for runaway
+        runaway_window = 10    # seconds
+        last_elem_temp = None
+        last_elem_time = None
+        sensor_fail_timeout = 10  # seconds
+        last_elem_ok = time.time()
         while self._running:
+            now = time.time()
             air_temp = self.get_air_temp()
             element_temp = self.get_element_temp()
-            if air_temp is None or element_temp is None:
-                self.set_power(0.0)
-                time.sleep(1)
-                continue
-            if air_temp < self.target_air:
+            # Sensor fail detection
+            if element_temp is None:
+                if now - last_elem_ok > sensor_fail_timeout:
+                    self._shutdown_heater('MAX6675 sensor failure: no reading >%ds' % sensor_fail_timeout)
+                    break
+            else:
+                last_elem_ok = now
+            # Overtemp protection (throttle at 220C, shutdown at 260C)
+            if element_temp is not None:
+                if element_temp > shutdown_temp:
+                    self._shutdown_heater('Element temperature exceeded %dC (%.2fC)' % (shutdown_temp, element_temp))
+                    break
+                elif element_temp > throttle_temp:
+                    self.set_power(0.0)
+                    time.sleep(1)
+                    continue
+            # Runaway detection
+            if last_elem_temp is not None and element_temp is not None:
+                dt = now - last_elem_time if last_elem_time else 1
+                if dt > 0:
+                    rate = (element_temp - last_elem_temp) / dt
+                    if rate > runaway_rate:
+                        self._shutdown_heater('Thermal runaway detected: rate %.2fC/s' % rate)
+                        break
+            last_elem_temp = element_temp
+            last_elem_time = now
+            # Control logic: full power until air temp setpoint, then PID for element
+            if air_temp is not None and air_temp < self.target_air:
                 self.set_power(1.0)
             else:
-                # PID to keep element just above air temp
-                self._pid.set_setpoint(air_temp + self.element_offset)
-                output = self._pid.compute(element_temp)
-                self.set_power(output)
+                target_elem = (air_temp or 0) + self.element_offset
+                self._pid.setpoint = target_elem
+                power = self._pid.compute(element_temp or 0)
+                self.set_power(max(0.0, min(1.0, power)))
             time.sleep(self._pid.sample_time)
 
     def set_power(self, power):
@@ -159,8 +192,11 @@ class Max6675Heater:
         air_temp = self.get_air_temp() or -999
         element_temp = self.get_element_temp() or -999
         humidity = self._dht22_humidity if hasattr(self, '_dht22_humidity') and self._dht22_humidity is not None else -999
-        gcmd.respond_info('Air temp: %.2fC, Humidity: %.1f%%, Element temp: %.2fC, Power: %.2f%%' % (
-            air_temp, humidity, element_temp, self.heater_power * 100.0))
+        msg = 'Air temp: %.2fC, Humidity: %.1f%%, Element temp: %.2fC, Power: %.2f%%' % (
+            air_temp, humidity, element_temp, self.heater_power * 100.0)
+        if self._error:
+            msg += '\nERROR: ' + self._error
+        gcmd.respond_info(msg)
     def cmd_TUNE_HEATER_PID(self, gcmd):
         kp = gcmd.get_float('KP', None)
         ki = gcmd.get_float('KI', None)
@@ -195,7 +231,15 @@ class Max6675Heater:
         for entry in self._log_entries:
             ts, power, air, elem, hum = entry
             lines.append(f"{ts},{power:.3f},{air:.2f},{elem:.2f},{hum:.1f}")
+        if self._error:
+            lines.append(f"ERROR: {self._error}")
         gcmd.respond_info("\n".join(lines))
+
+    def _shutdown_heater(self, reason):
+        self.set_power(0.0)
+        self._error = reason
+        self._running = False
+        self._log.warning('Heater shutdown: %s', reason)
 
 def load_config(config):
     return Max6675Heater(config)
