@@ -99,6 +99,9 @@ class Max6675Heater:
             self.max_temp = config.getfloat('max_temp', 300.0)
             self.min_temp = config.getfloat('min_temp', 0.0)
             self.element_offset = config.getfloat('element_offset', 10.0)
+            # Optional fan GPIO to cool elements during/after heat
+            self.fan_pin = config.get('fan_pin', fallback=None)
+            self.fan_active_high = bool(config.getboolean('fan_active_high', True))
             # DHT22 pin is optional: if not given, DHT features are disabled
             try:
                 self.dht22_pin = config.getint('dht22_pin')
@@ -138,6 +141,13 @@ class Max6675Heater:
         self._mcu_ok = False
         self._max6675_ok = False
         self._ssr_ok = False
+        self._fan_ok = False
+
+        # Fan state & cooling control
+        self._fan_on = False
+        self._cooling_active = False
+        # Ratio within which air and element are considered at ambient equilibrium
+        self.cool_ratio = float(config.getfloat('cool_ratio', 0.10))
 
         # Register commands and events (try to keep same hooks as original)
         try:
@@ -217,6 +227,17 @@ class Max6675Heater:
                 self._log.debug("ssr_pwm_set probe failed: %s", e)
                 self._ssr_ok = False
 
+            # Try probing fan gpio command if configured
+            if self.fan_pin is not None:
+                try:
+                    # Inform MCU of the fan pin if required by its implementation; if not, this send should still be harmless.
+                    # We assume an MCU command 'fan_gpio_set' that accepts value=0/1 and uses pre-configured pin.
+                    self.mcu.send('fan_gpio_set', value=0)
+                    self._fan_ok = True
+                except Exception as e:
+                    self._log.debug("fan_gpio_set probe failed: %s", e)
+                    self._fan_ok = False
+
             # Basic mcu reachability
             self._mcu_ok = True
         except Exception as e:
@@ -227,6 +248,21 @@ class Max6675Heater:
             self._log.warning("MAX6675 read not confirmed on MCU; get_element_temp() will return None until correct MCU impl is provided.")
         if not self._ssr_ok:
             self._log.warning("ssr_pwm_set not confirmed on MCU; SSR output may not work.")
+        if self.fan_pin is not None and not self._fan_ok:
+            self._log.warning("fan_gpio_set not confirmed on MCU; fan GPIO control disabled.")
+
+    def _send_fan_gpio(self, on: bool):
+        """Set fan GPIO state. Honors active-high setting. No-op if not available."""
+        desired = bool(on)
+        # Map logical on/off to electrical level
+        level = 1 if (desired == self.fan_active_high) else 0
+        if not self._mcu_ok or not self._fan_ok:
+            return
+        try:
+            self.mcu.send('fan_gpio_set', value=int(level))
+            self._fan_on = desired
+        except Exception as e:
+            self._log.debug("Failed to set fan_gpio_set on MCU: %s", e)
 
     def _dht22_loop(self):
         """Poll DHT22 in its own thread; does not block control loop."""
@@ -334,6 +370,30 @@ class Max6675Heater:
         # send PWM outside of the lock to avoid blocking other operations
         pwm_value = int(p * 65535)
         self._send_ssr_pwm_set(pwm_value)
+        # Manage fan based on heater power transitions
+        try:
+            if p > 0.0:
+                # Heating started/continuing: ensure fan on and cancel post-cooling state
+                if not self._fan_on:
+                    self._send_fan_gpio(True)
+                self._cooling_active = False
+            else:
+                # Heating stopped: if we have both sensors, start cooling
+                air = self.get_air_temp()
+                elem = self.get_element_temp()
+                if (air is not None) and (elem is not None):
+                    # Begin post-cooling until temps converge
+                    self._cooling_active = True
+                    if not self._fan_on:
+                        self._send_fan_gpio(True)
+                else:
+                    # No air sensor -> stop fan immediately
+                    if self._fan_on:
+                        self._send_fan_gpio(False)
+                        self._cooling_active = False
+        except Exception:
+            # Fan control should never disrupt heater control
+            pass
 
     def _control_loop(self):
         """Main control loop. Runs PID and safety checks at PID.sample_time intervals."""
@@ -404,6 +464,27 @@ class Max6675Heater:
                     # compute using last known element temp (0 if None)
                     power = self._pid.compute(element_temp or 0.0)
                     self.set_power(max(0.0, min(1.0, power)))
+
+                # Post-cooling logic: if heater power is zero and cooling is active, keep fan on
+                # until air and element temps are within cool_ratio of each other.
+                if self.heater_power == 0.0 and self._cooling_active:
+                    if (air_temp is not None) and (element_temp is not None):
+                        high = max(air_temp, element_temp)
+                        if high > 0:
+                            diff = abs(element_temp - air_temp) / high
+                            if diff <= self.cool_ratio:
+                                # Temps have converged; stop fan and end cooling
+                                if self._fan_on:
+                                    self._send_fan_gpio(False)
+                                self._cooling_active = False
+                        # Ensure fan remains on during cooling
+                        if not self._fan_on:
+                            self._send_fan_gpio(True)
+                    else:
+                        # Missing sensors -> cancel cooling and stop fan
+                        if self._fan_on:
+                            self._send_fan_gpio(False)
+                        self._cooling_active = False
             except Exception as e:
                 self._log.exception("Exception in control loop: %s", e)
                 # On unexpected error, do not crash the process; put heater into safe-off state
