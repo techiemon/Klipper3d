@@ -6,6 +6,7 @@ import logging
 import threading
 import time
 from typing import Optional
+from . import bus
 
 
 class PID:
@@ -106,6 +107,9 @@ class Max6675Heater:
             self.pid_ki = config.getfloat('pid_ki', 0.1)
             self.pid_kd = config.getfloat('pid_kd', 1.0)
             sample_time = config.getfloat('pid_sample_time', 2.0)
+            # SPI setup for MAX6675 (mode 0). Use standard bus helper so we get an spi_oid
+            # Supports either hardware SPI (spi_bus + cs_pin) or software SPI (spi_software_*_pin + cs_pin)
+            self.spi = bus.MCU_SPI_from_config(config, mode=0, pin_option='cs_pin', default_speed=1000000)
         except Exception as e:
             # Re-raise as a more helpful error for Klipper loading
             self._log.exception("Configuration error during Max6675Heater init")
@@ -156,6 +160,12 @@ class Max6675Heater:
             self.printer.register_event_handler('gcode:PRINT_ABORT', self._on_print_stop)
         except Exception:
             self._log.exception("Failed to register gcode/event handlers")
+
+        # Register config build callback to bind MAX6675 to our SPI device on the MCU
+        try:
+            self.mcu.register_config_callback(self._build_config)
+        except Exception:
+            self._log.debug("Failed to register build_config callback for MAX6675")
 
         # Probe MCU commands non-fatally (do not raise on failure; we operate degraded)
         self._probe_mcu_commands()
@@ -233,10 +243,10 @@ class Max6675Heater:
 
             # Try sending a small SSR pwm value (don't change real hardware if possible)
             try:
-                self.mcu.send('ssr_pwm_set', value=0)
+                self.mcu.send('set_ssr_pwm', value=0)
                 self._ssr_ok = True
             except Exception as e:
-                self._log.debug("ssr_pwm_set probe failed: %s", e)
+                self._log.debug("set_ssr_pwm probe failed: %s", e)
                 self._ssr_ok = False
 
             # Try probing fan gpio command if configured
@@ -259,7 +269,7 @@ class Max6675Heater:
         if not self._max6675_ok:
             self._log.warning("MAX6675 read not confirmed on MCU; get_element_temp() will return None until correct MCU impl is provided.")
         if not self._ssr_ok:
-            self._log.warning("ssr_pwm_set not confirmed on MCU; SSR output may not work.")
+            self._log.warning("set_ssr_pwm not confirmed on MCU; SSR output may not work.")
         if self.fan_pin is not None and not self._fan_ok:
             self._log.warning("fan_gpio_set not confirmed on MCU; fan GPIO control disabled.")
 
@@ -324,9 +334,18 @@ class Max6675Heater:
         try:
             # clamp value defensively
             v = int(max(0, min(65535, int(value))))
-            self.mcu.send('ssr_pwm_set', value=v)
+            self.mcu.send('set_ssr_pwm', value=v)
         except Exception as e:
-            self._log.warning("Failed to set ssr_pwm_set on MCU: %s", e)
+            self._log.warning("Failed to set set_ssr_pwm on MCU: %s", e)
+
+    def _build_config(self):
+        """Bind the MCU MAX6675 driver to the SPI device we created."""
+        try:
+            spi_oid = self.spi.get_oid()
+            # Send during config so MCU stores the SPI handle for MAX6675
+            self.mcu.add_config_cmd("config_max6675 spi_oid=%d" % (spi_oid,))
+        except Exception as e:
+            self._log.debug("config_max6675 add_config_cmd failed: %s", e)
 
     def get_air_temp(self) -> Optional[float]:
         with self._lock:
