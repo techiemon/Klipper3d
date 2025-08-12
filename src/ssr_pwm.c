@@ -36,7 +36,7 @@ command_ssr_pwm_set(uint32_t *args)
 {
     // args[0]: value
     ssr_pwm_set(args[0]);
-    sendf("ssr_pwm_set value=%u\n", args[0]);
+    sendf("ssr_pwm_set_ack value=%u\n", args[0]);
 }
 
 void
@@ -45,5 +45,5 @@ command_ssr_pwm_get(uint32_t *args)
     sendf("ssr_pwm_result value=%u\n", ssr_pwm_value);
 }
 
-DECL_COMMAND(command_ssr_pwm_set, "ssr_pwm_set value=%hu");
+DECL_COMMAND(command_ssr_pwm_set, "set_ssr_pwm value=%hu");
 DECL_COMMAND(command_ssr_pwm_get, "get_ssr_pwm");
