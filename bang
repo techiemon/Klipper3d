@@ -1,3 +1,11 @@
 git add src
+git add config
+git add docs
+git add klippy
+git add lib
+git add mcu_example
+git add scripts
+git add test
+git add README.md
 git commit -m "ai debugging"
 git push origin aht20
