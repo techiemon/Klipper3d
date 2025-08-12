@@ -102,6 +102,9 @@ class Max6675Heater:
             # Optional ambient sensor provided by another module (e.g. aht10/aht20)
             # Example: ambient_sensor: "aht10 my_ambient"
             self.ambient_sensor = config.get('ambient_sensor', fallback=None)
+            # Optional MCU internal temperature sensor (temperature_mcu)
+            # Example: mcu_temp_sensor: "temperature_mcu my_mcu"
+            self.mcu_temp_sensor = config.get('mcu_temp_sensor', fallback=None)
             # PID
             self.pid_kp = config.getfloat('pid_kp', 2.0)
             self.pid_ki = config.getfloat('pid_ki', 0.1)
@@ -126,9 +129,10 @@ class Max6675Heater:
         self._aht20_temp: Optional[float] = None
         self._aht20_humidity: Optional[float] = None
         self._element_temp: Optional[float] = None
+        self._mcu_temp: Optional[float] = None
 
         self._log_entries = []  # list of tuples
-        self._log_accum = {'power': [], 'air': [], 'elem': [], 'hum': []}
+        self._log_accum = {'power': [], 'air': [], 'elem': [], 'hum': [], 'mcu': []}
         self._last_log_time = time.time()
 
         # PID controller
@@ -183,6 +187,18 @@ class Max6675Heater:
             except Exception:
                 self._log.exception("Failed to attach ambient sensor '%s'", self.ambient_sensor)
 
+        # Optional: attach to MCU internal temperature sensor (temperature_mcu)
+        if self.mcu_temp_sensor:
+            try:
+                mts = self.printer.lookup_object(self.mcu_temp_sensor)
+                if hasattr(mts, 'setup_minmax'):
+                    mts.setup_minmax(self.min_temp, self.max_temp)
+                if hasattr(mts, 'setup_callback'):
+                    mts.setup_callback(self._on_mcu_temp_sample)
+                self._log.info("Attached MCU temp sensor: %s", self.mcu_temp_sensor)
+            except Exception:
+                self._log.exception("Failed to attach MCU temp sensor '%s'", self.mcu_temp_sensor)
+
         # Threads (only start those that are applicable)
         self._control_thread = threading.Thread(target=self._control_loop, name='max6675_control', daemon=True)
         self._control_thread.start()
@@ -206,6 +222,17 @@ class Max6675Heater:
         with self._lock:
             self._aht20_temp = t
             self._log_accum['air'].append(t)
+
+    def _on_mcu_temp_sample(self, print_time, temp):
+        try:
+            t = float(temp) if temp is not None else None
+        except Exception:
+            t = None
+        if t is None:
+            return
+        with self._lock:
+            self._mcu_temp = t
+            self._log_accum['mcu'].append(t)
 
     def _register_gcodes(self):
         # Keep the original names for compatibility.
@@ -516,6 +543,7 @@ class Max6675Heater:
                             int(now),
                             avg(self._log_accum['power']),
                             avg(self._log_accum['air']),
+                            avg(self._log_accum['mcu']),
                             avg(self._log_accum['elem']),
                             avg(self._log_accum['hum']),
                         )
@@ -553,10 +581,12 @@ class Max6675Heater:
         with self._lock:
             air_temp = self._aht20_temp if self._aht20_temp is not None else None
             element_temp = self._element_temp if self._element_temp is not None else None
+            mcu_temp = self._mcu_temp if self._mcu_temp is not None else None
             humidity = self._aht20_humidity if self._aht20_humidity is not None else None
             power_pct = self.heater_power * 100.0
-            msg = 'Air temp: %s, Humidity: %s, Element temp: %s, Power: %.2f%%' % (
+            msg = 'Air temp: %s, MCU temp: %s, Humidity: %s, Element temp: %s, Power: %.2f%%' % (
                 ('%.2fC' % air_temp) if air_temp is not None else 'N/A',
+                ('%.2fC' % mcu_temp) if mcu_temp is not None else 'N/A',
                 ('%.1f%%' % humidity) if humidity is not None else 'N/A',
                 ('%.2fC' % element_temp) if element_temp is not None else 'N/A',
                 power_pct)
@@ -583,13 +613,20 @@ class Max6675Heater:
 
     def cmd_EXPORT_HEATER_LOG(self, gcmd):
         """Return CSV-like aggregated log data. Handles missing values gracefully."""
-        lines = ["timestamp,avg_power,avg_air,avg_element,avg_humidity"]
+        lines = ["timestamp,avg_power,avg_air,avg_mcu,avg_element,avg_humidity"]
         with self._lock:
             for entry in self._log_entries:
-                ts, power, air, elem, hum = entry
+                ts, power, air, mcu, elem, hum = entry
                 def fmt(v, f):
                     return ('%.3f' % v) if v is not None else ''
-                lines.append("%d,%s,%s,%s,%s" % (ts, fmt(power, '%.3f'), fmt(air, '%.2f'), fmt(elem, '%.2f'), fmt(hum, '%.1f')))
+                lines.append("%d,%s,%s,%s,%s,%s" % (
+                    ts,
+                    fmt(power, '%.3f'),
+                    fmt(air, '%.2f'),
+                    fmt(mcu, '%.2f'),
+                    fmt(elem, '%.2f'),
+                    fmt(hum, '%.1f')
+                ))
             if self._error:
                 lines.append(f"ERROR: {self._error}")
         gcmd.respond_info("\n".join(lines))
