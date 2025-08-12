@@ -7,10 +7,6 @@ import threading
 import time
 from typing import Optional
 
-try:
-    import Adafruit_DHT
-except ImportError:
-    Adafruit_DHT = None
 
 class PID:
     def __init__(self, kp, ki, kd, setpoint=0.0, sample_time=2.0, output_limits=(0.0, 1.0)):
@@ -102,12 +98,9 @@ class Max6675Heater:
             # Optional fan GPIO to cool elements during/after heat
             self.fan_pin = config.get('fan_pin', fallback=None)
             self.fan_active_high = bool(config.getboolean('fan_active_high', True))
-            # DHT22 pin is optional: if not given, DHT features are disabled
-            try:
-                self.dht22_pin = config.getint('dht22_pin')
-            except Exception:
-                self.dht22_pin = None
-            self.dht22_interval = config.getfloat('dht22_interval', 2.0)
+            # Optional ambient sensor provided by another module (e.g. aht10/aht20)
+            # Example: ambient_sensor: "aht10 my_ambient"
+            self.ambient_sensor = config.get('ambient_sensor', fallback=None)
             # PID
             self.pid_kp = config.getfloat('pid_kp', 2.0)
             self.pid_ki = config.getfloat('pid_ki', 0.1)
@@ -126,8 +119,8 @@ class Max6675Heater:
         self._error = None
 
         # Sensors & logs
-        self._dht22_temp: Optional[float] = None
-        self._dht22_humidity: Optional[float] = None
+        self._aht20_temp: Optional[float] = None
+        self._aht20_humidity: Optional[float] = None
         self._element_temp: Optional[float] = None
 
         self._log_entries = []  # list of tuples
@@ -167,23 +160,42 @@ class Max6675Heater:
         # Probe MCU commands non-fatally (do not raise on failure; we operate degraded)
         self._probe_mcu_commands()
 
+        # Optional: attach to ambient sensor (e.g. AHT10/AHT20) on MCU I2C
+        if self.ambient_sensor:
+            try:
+                amb = self.printer.lookup_object(self.ambient_sensor)
+                # Program safe min/max into sensor for basic protection
+                if hasattr(amb, 'setup_minmax'):
+                    amb.setup_minmax(self.min_temp, self.max_temp)
+                if hasattr(amb, 'setup_callback'):
+                    amb.setup_callback(self._on_ambient_sample)
+                self._log.info("Attached ambient sensor: %s", self.ambient_sensor)
+            except Exception:
+                self._log.exception("Failed to attach ambient sensor '%s'", self.ambient_sensor)
+
         # Threads (only start those that are applicable)
         self._control_thread = threading.Thread(target=self._control_loop, name='max6675_control', daemon=True)
         self._control_thread.start()
-
-        if Adafruit_DHT is not None and self.dht22_pin is not None:
-            self._dht22_thread = threading.Thread(target=self._dht22_loop, name='max6675_dht22', daemon=True)
-            self._dht22_thread.start()
-        else:
-            if self.dht22_pin is None:
-                self._log.info("DHT22 pin not configured; skipping DHT22 thread.")
-            else:
-                self._log.warning("Adafruit_DHT library not installed; skipping DHT22 support.")
 
         self._log_thread = threading.Thread(target=self._log_loop, name='max6675_logger', daemon=True)
         self._log_thread.start()
 
         self._log.info('Max6675Heater initialized (hardened)')
+
+    def _on_ambient_sample(self, print_time, temp):
+        """Callback from an external ambient sensor (e.g., AHT10/AHT20).
+        Only temperature is provided via callback; humidity, if desired, can be
+        queried from that module's get_status() separately.
+        """
+        try:
+            t = float(temp) if temp is not None else None
+        except Exception:
+            t = None
+        if t is None:
+            return
+        with self._lock:
+            self._aht20_temp = t
+            self._log_accum['air'].append(t)
 
     def _register_gcodes(self):
         # Keep the original names for compatibility.
@@ -264,31 +276,6 @@ class Max6675Heater:
         except Exception as e:
             self._log.debug("Failed to set fan_gpio_set on MCU: %s", e)
 
-    def _dht22_loop(self):
-        """Poll DHT22 in its own thread; does not block control loop."""
-        if Adafruit_DHT is None:
-            self._log.warning('Adafruit_DHT not installed, DHT22/AM2302 not available')
-            return
-        if self.dht22_pin is None:
-            self._log.info("DHT22 pin not configured; skipping DHT22 loop")
-            return
-
-        while not self._stop_event.is_set():
-            try:
-                # read_retry already performs retries with small delays; keep interval reasonable
-                humidity, temp = Adafruit_DHT.read_retry(Adafruit_DHT.DHT22, self.dht22_pin)
-                with self._lock:
-                    if temp is not None:
-                        self._dht22_temp = float(temp)
-                        self._log_accum['air'].append(self._dht22_temp)
-                    if humidity is not None:
-                        self._dht22_humidity = float(humidity)
-                        self._log_accum['hum'].append(self._dht22_humidity)
-                time.sleep(self.dht22_interval)
-            except Exception as e:
-                self._log.exception("Error in DHT22 loop: %s", e)
-                # wait a bit to avoid spinning on fatal errors
-                time.sleep(max(1.0, self.dht22_interval))
 
     def _send_max6675_read(self):
         """Query MCU for MAX6675 reading. Returns float in C or None."""
@@ -343,8 +330,8 @@ class Max6675Heater:
 
     def get_air_temp(self) -> Optional[float]:
         with self._lock:
-            val = self._dht22_temp
-            # accumulators are updated in DHT thread already
+            val = self._aht20_temp
+            # accumulators are updated in ambient callback or local sensor thread
             return None if val is None else float(val)
 
     def get_element_temp(self) -> Optional[float]:
@@ -545,9 +532,9 @@ class Max6675Heater:
 
     def cmd_QUERY_HEATER(self, gcmd):
         with self._lock:
-            air_temp = self._dht22_temp if self._dht22_temp is not None else None
+            air_temp = self._aht20_temp if self._aht20_temp is not None else None
             element_temp = self._element_temp if self._element_temp is not None else None
-            humidity = self._dht22_humidity if self._dht22_humidity is not None else None
+            humidity = self._aht20_humidity if self._aht20_humidity is not None else None
             power_pct = self.heater_power * 100.0
             msg = 'Air temp: %s, Humidity: %s, Element temp: %s, Power: %.2f%%' % (
                 ('%.2fC' % air_temp) if air_temp is not None else 'N/A',
@@ -622,8 +609,6 @@ class Max6675Heater:
         try:
             if hasattr(self, '_control_thread'):
                 self._control_thread.join(timeout=2.0)
-            if hasattr(self, '_dht22_thread'):
-                self._dht22_thread.join(timeout=2.0)
             if hasattr(self, '_log_thread'):
                 self._log_thread.join(timeout=2.0)
         except Exception:
