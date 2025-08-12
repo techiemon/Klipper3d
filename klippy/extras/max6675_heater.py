@@ -102,12 +102,18 @@ class Max6675Heater:
             # Optional fan GPIO to cool elements during/after heat
             self.fan_pin = config.get('fan_pin', fallback=None)
             self.fan_active_high = bool(config.getboolean('fan_active_high', True))
-            # DHT22 pin is optional: if not given, DHT features are disabled
+            # DHT22 options
+            # Mode 'host' uses Adafruit_DHT on the Raspberry Pi GPIO.
+            # Mode 'mcu' uses MCU firmware commands to read DHT22 from RP2040.
+            self.dht22_mode = config.get('dht22_mode', fallback='host').strip().lower()
             try:
                 self.dht22_pin = config.getint('dht22_pin')
             except Exception:
                 self.dht22_pin = None
             self.dht22_interval = config.getfloat('dht22_interval', 2.0)
+            # MCU DHT22
+            self.dht22_mcu_pin = config.get('dht22_mcu_pin', fallback=None)
+            self.dht22_mcu_interval = config.getfloat('dht22_mcu_interval', self.dht22_interval)
             # PID
             self.pid_kp = config.getfloat('pid_kp', 2.0)
             self.pid_ki = config.getfloat('pid_ki', 0.1)
@@ -171,14 +177,25 @@ class Max6675Heater:
         self._control_thread = threading.Thread(target=self._control_loop, name='max6675_control', daemon=True)
         self._control_thread.start()
 
-        if Adafruit_DHT is not None and self.dht22_pin is not None:
+        # Start DHT22 thread for either MCU mode or host mode
+        start_dht = False
+        if self.dht22_mode == 'mcu':
+            if getattr(self, '_dht22_mcu_ok', False):
+                start_dht = True
+            else:
+                self._log.info("MCU DHT22 not confirmed; skipping DHT22 thread.")
+        else:
+            if Adafruit_DHT is not None and self.dht22_pin is not None:
+                start_dht = True
+            else:
+                if self.dht22_pin is None:
+                    self._log.info("DHT22 pin not configured; skipping DHT22 thread.")
+                else:
+                    self._log.warning("Adafruit_DHT library not installed; skipping DHT22 support.")
+
+        if start_dht:
             self._dht22_thread = threading.Thread(target=self._dht22_loop, name='max6675_dht22', daemon=True)
             self._dht22_thread.start()
-        else:
-            if self.dht22_pin is None:
-                self._log.info("DHT22 pin not configured; skipping DHT22 thread.")
-            else:
-                self._log.warning("Adafruit_DHT library not installed; skipping DHT22 support.")
 
         self._log_thread = threading.Thread(target=self._log_loop, name='max6675_logger', daemon=True)
         self._log_thread.start()
@@ -230,13 +247,39 @@ class Max6675Heater:
             # Try probing fan gpio command if configured
             if self.fan_pin is not None:
                 try:
-                    # Inform MCU of the fan pin if required by its implementation; if not, this send should still be harmless.
-                    # We assume an MCU command 'fan_gpio_set' that accepts value=0/1 and uses pre-configured pin.
+                    # Probe fan command; assumes MCU already knows the pin
                     self.mcu.send('fan_gpio_set', value=0)
                     self._fan_ok = True
                 except Exception as e:
                     self._log.debug("fan_gpio_set probe failed: %s", e)
                     self._fan_ok = False
+
+            # Probe optional DHT22 on MCU
+            if self.dht22_mode == 'mcu' and self.dht22_mcu_pin is not None:
+                try:
+                    # Configure MCU DHT22 with minimum interval (convert seconds to usec)
+                    min_interval_us = int(max(0.5, float(self.dht22_mcu_interval)) * 1_000_000)
+                    try:
+                        self.mcu.send('dht22_config', pin=int(self.dht22_mcu_pin), min_interval_us=min_interval_us)
+                    except Exception as ce:
+                        self._log.debug("dht22_config failed: %s", ce)
+                    resp = None
+                    try:
+                        resp = self.mcu.send('dht22_read')
+                    except Exception as re:
+                        self._log.debug("dht22_read probe failed: %s", re)
+                    if resp and isinstance(resp, str):
+                        for line in resp.splitlines():
+                            line = line.strip()
+                            if not line:
+                                continue
+                            if line.startswith('dht22'):
+                                # Accept either float or *10 integer fields
+                                self._dht22_mcu_ok = True
+                                break
+                except Exception as e:
+                    self._dht22_mcu_ok = False
+                    self._log.debug("MCU dht22 probe failed: %s", e)
 
             # Basic mcu reachability
             self._mcu_ok = True
@@ -250,6 +293,8 @@ class Max6675Heater:
             self._log.warning("ssr_pwm_set not confirmed on MCU; SSR output may not work.")
         if self.fan_pin is not None and not self._fan_ok:
             self._log.warning("fan_gpio_set not confirmed on MCU; fan GPIO control disabled.")
+        if self.dht22_mode == 'mcu' and self.dht22_mcu_pin is not None and not getattr(self, '_dht22_mcu_ok', False):
+            self._log.warning("MCU DHT22 not confirmed; falling back to no air sensor.")
 
     def _send_fan_gpio(self, on: bool):
         """Set fan GPIO state. Honors active-high setting. No-op if not available."""
@@ -265,7 +310,59 @@ class Max6675Heater:
             self._log.debug("Failed to set fan_gpio_set on MCU: %s", e)
 
     def _dht22_loop(self):
-        """Poll DHT22 in its own thread; does not block control loop."""
+        """Poll DHT22 in its own thread; does not block control loop.
+        Supports host mode (Adafruit_DHT on Pi) and MCU mode (dht22_read).
+        """
+        if self.dht22_mode == 'mcu':
+            if not getattr(self, '_dht22_mcu_ok', False):
+                self._log.info('MCU DHT22 not available; skipping DHT22 loop')
+                return
+            interval = max(0.5, float(self.dht22_mcu_interval))
+            while not self._stop_event.is_set():
+                try:
+                    resp = self.mcu.send('dht22_read')
+                    # Expected line: "dht22 temp=xx.x hum=yy.y"
+                    t, h = None, None
+                    if resp:
+                        for line in resp.splitlines():
+                            line = line.strip()
+                            if line.startswith('dht22'):
+                                parts = line.split()
+                                for p in parts:
+                                    if p.startswith('temp='):
+                                        try:
+                                            t = float(p.split('=',1)[1])
+                                        except Exception:
+                                            pass
+                                    if p.startswith('temp10='):
+                                        try:
+                                            t = float(int(p.split('=',1)[1]) / 10.0)
+                                        except Exception:
+                                            pass
+                                    if p.startswith('hum='):
+                                        try:
+                                            h = float(p.split('=',1)[1])
+                                        except Exception:
+                                            pass
+                                    if p.startswith('hum10='):
+                                        try:
+                                            h = float(int(p.split('=',1)[1]) / 10.0)
+                                        except Exception:
+                                            pass
+                                break
+                    with self._lock:
+                        if t is not None:
+                            self._dht22_temp = t
+                            self._log_accum['air'].append(t)
+                        if h is not None:
+                            self._dht22_humidity = h
+                            self._log_accum['hum'].append(h)
+                except Exception as e:
+                    self._log.debug('Error reading MCU DHT22: %s', e)
+                self._stop_event.wait(interval)
+            return
+
+        # Host mode (default)
         if Adafruit_DHT is None:
             self._log.warning('Adafruit_DHT not installed, DHT22/AM2302 not available')
             return
@@ -275,7 +372,6 @@ class Max6675Heater:
 
         while not self._stop_event.is_set():
             try:
-                # read_retry already performs retries with small delays; keep interval reasonable
                 humidity, temp = Adafruit_DHT.read_retry(Adafruit_DHT.DHT22, self.dht22_pin)
                 with self._lock:
                     if temp is not None:
@@ -287,7 +383,6 @@ class Max6675Heater:
                 time.sleep(self.dht22_interval)
             except Exception as e:
                 self._log.exception("Error in DHT22 loop: %s", e)
-                # wait a bit to avoid spinning on fatal errors
                 time.sleep(max(1.0, self.dht22_interval))
 
     def _send_max6675_read(self):
