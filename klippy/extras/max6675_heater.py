@@ -88,8 +88,8 @@ class Max6675Heater:
                 self.name = full_name
 
             # Pins and params
-            self.cs_pin = config.get('cs_pin', fallback=None)
-            self.ssr_pin = config.get('ssr_pin', fallback=None)
+            self.cs_pin = config.get('cs_pin', None)
+            self.ssr_pin = config.get('ssr_pin', None)
             if self.cs_pin is None or self.ssr_pin is None:
                 raise ValueError("cs_pin and ssr_pin must be specified")
 
@@ -99,14 +99,14 @@ class Max6675Heater:
             self.min_temp = config.getfloat('min_temp', 0.0)
             self.element_offset = config.getfloat('element_offset', 10.0)
             # Optional fan GPIO to cool elements during/after heat
-            self.fan_pin = config.get('fan_pin', fallback=None)
+            self.fan_pin = config.get('fan_pin', None)
             self.fan_active_high = bool(config.getboolean('fan_active_high', True))
             # Optional ambient sensor provided by another module (e.g. aht10/aht20)
             # Example: ambient_sensor: "aht10 my_ambient"
-            self.ambient_sensor = config.get('ambient_sensor', fallback=None)
+            self.ambient_sensor = config.get('ambient_sensor', None)
             # Optional MCU internal temperature sensor (temperature_mcu)
             # Example: mcu_temp_sensor: "temperature_mcu my_mcu"
-            self.mcu_temp_sensor = config.get('mcu_temp_sensor', fallback=None)
+            self.mcu_temp_sensor = config.get('mcu_temp_sensor', None)
             # PID
             self.pid_kp = config.getfloat('pid_kp', 2.0)
             self.pid_ki = config.getfloat('pid_ki', 0.1)
