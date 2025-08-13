@@ -7,6 +7,7 @@ import threading
 import time
 from typing import Optional
 from . import bus
+import mcu
 
 
 class PID:
@@ -75,7 +76,8 @@ class Max6675Heater:
             mcu_name = config.get('mcu')
             if not mcu_name:
                 raise ValueError("Missing required config: 'mcu'")
-            self.mcu = self.printer.lookup_object(mcu_name)
+            # Resolve the MCU by alias using Klipper's helper
+            self.mcu = mcu.get_printer_mcu(self.printer, mcu_name)
 
             # name: keep original behavior but robust
             full_name = config.get_name()
