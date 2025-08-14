@@ -237,13 +237,18 @@ class Max6675Heater:
             self._log_accum['mcu'].append(t)
 
     def _register_gcodes(self):
-        # Keep the original names for compatibility.
-        self.printer.register_event_handler('gcode:SET_HEATER_TEMP', self.cmd_SET_HEATER_TEMP)
-        self.printer.register_event_handler('gcode:SET_HEATER_POWER', self.cmd_SET_HEATER_POWER)
-        self.printer.register_event_handler('gcode:QUERY_HEATER', self.cmd_QUERY_HEATER)
-        self.printer.register_event_handler('gcode:TUNE_HEATER_PID', self.cmd_TUNE_HEATER_PID)
-        # Export log
-        self.printer.register_event_handler('gcode:EXPORT_HEATER_LOG', self.cmd_EXPORT_HEATER_LOG)
+        # Register commands with Klipper's gcode object so they're available to users.
+        gcode = self.printer.lookup_object('gcode')
+        gcode.register_command('SET_HEATER_TEMP', self.cmd_SET_HEATER_TEMP,
+                               desc='Set target temperatures for MAX6675 heater control')
+        gcode.register_command('SET_HEATER_POWER', self.cmd_SET_HEATER_POWER,
+                               desc='Manually set heater power (0.0-1.0) for MAX6675 heater')
+        gcode.register_command('QUERY_HEATER', self.cmd_QUERY_HEATER,
+                               desc='Query current heater, air, and MCU temperatures and state')
+        gcode.register_command('TUNE_HEATER_PID', self.cmd_TUNE_HEATER_PID,
+                               desc='Run PID autotune for MAX6675 heater')
+        gcode.register_command('EXPORT_HEATER_LOG', self.cmd_EXPORT_HEATER_LOG,
+                               desc='Export recent heater telemetry log as CSV via M118 responses')
 
     def _on_ready(self):
         self._log.info('MAX6675 Heater ready')
