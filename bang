@@ -8,4 +8,4 @@ git add scripts
 git add test
 git add README.md
 git commit -m "ai debugging"
-git push origin aht20
+git push origin alt_max6675 
