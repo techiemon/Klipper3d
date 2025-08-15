@@ -200,7 +200,9 @@ class Max6675Heater:
         except Exception:
             t = None
         if t is None:
+            self._log.debug("Ambient sensor callback: temp is None")
             return
+        self._log.debug("Ambient sensor callback: temp=%.2f°C at print_time=%.3f", t, float(print_time or 0.0))
         with self._lock:
             self._aht20_temp = t
             self._log_accum['air'].append(t)
@@ -223,12 +225,10 @@ class Max6675Heater:
         except Exception:
             t = None
         if t is None:
+            self._log.debug("Element sensor callback: temp is None")
             return
         # Debug trace to confirm callback activity
-        try:
-            self._log.debug("element_sample: t=%.3f at print_time=%.3f", t, float(print_time or 0.0))
-        except Exception:
-            self._log.debug("element_sample: t=%s at print_time=%s", str(t), str(print_time))
+        self._log.debug("Element sensor callback: temp=%.2f°C at print_time=%.3f", t, float(print_time or 0.0))
         with self._lock:
             self._element_temp = t
             self._log_accum['elem'].append(t)
@@ -285,37 +285,54 @@ class Max6675Heater:
         # Optional: attach to ambient sensor (e.g. AHT10/AHT20) on MCU I2C
         if self.ambient_sensor:
             try:
+                self._log.info("Attempting to attach ambient sensor: %s", self.ambient_sensor)
                 amb = self.printer.lookup_object(self.ambient_sensor)
+                self._log.info("Found ambient sensor object: %s", type(amb).__name__)
                 if hasattr(amb, 'setup_minmax'):
                     amb.setup_minmax(self.min_temp, self.max_temp)
+                    self._log.debug("Set minmax on ambient sensor")
                 if hasattr(amb, 'setup_callback'):
                     amb.setup_callback(self._on_ambient_sample)
-                self._log.info("Attached ambient sensor: %s", self.ambient_sensor)
+                    self._log.info("Registered ambient sensor callback on '%s'", self.ambient_sensor)
+                else:
+                    self._log.warning("Ambient sensor '%s' has no setup_callback method", self.ambient_sensor)
+                self._log.info("Successfully attached ambient sensor: %s", self.ambient_sensor)
             except Exception:
                 self._log.exception("Failed to attach ambient sensor '%s'", self.ambient_sensor)
 
         # Optional: attach to element temperature sensor (built-in temperature_sensor)
         if self.element_sensor:
             try:
+                self._log.info("Attempting to attach element sensor: %s", self.element_sensor)
                 elem = self.printer.lookup_object(self.element_sensor)
+                self._log.info("Found element sensor object: %s", type(elem).__name__)
                 if hasattr(elem, 'setup_minmax'):
                     elem.setup_minmax(self.min_temp, self.max_temp)
+                    self._log.debug("Set minmax on element sensor")
                 if hasattr(elem, 'setup_callback'):
                     elem.setup_callback(self._on_element_sample)
-                    self._log.debug("Registered element sensor callback on '%s'", self.element_sensor)
-                self._log.info("Attached element sensor: %s", self.element_sensor)
+                    self._log.info("Registered element sensor callback on '%s'", self.element_sensor)
+                else:
+                    self._log.warning("Element sensor '%s' has no setup_callback method", self.element_sensor)
+                self._log.info("Successfully attached element sensor: %s", self.element_sensor)
             except Exception:
                 self._log.exception("Failed to attach element sensor '%s'", self.element_sensor)
 
         # Optional: attach to MCU internal temperature sensor (temperature_mcu)
         if self.mcu_temp_sensor:
             try:
+                self._log.info("Attempting to attach MCU temp sensor: %s", self.mcu_temp_sensor)
                 mts = self.printer.lookup_object(self.mcu_temp_sensor)
+                self._log.info("Found MCU temp sensor object: %s", type(mts).__name__)
                 if hasattr(mts, 'setup_minmax'):
                     mts.setup_minmax(self.min_temp, self.max_temp)
+                    self._log.debug("Set minmax on MCU temp sensor")
                 if hasattr(mts, 'setup_callback'):
                     mts.setup_callback(self._on_mcu_temp_sample)
-                self._log.info("Attached MCU temp sensor: %s", self.mcu_temp_sensor)
+                    self._log.info("Registered MCU temp sensor callback on '%s'", self.mcu_temp_sensor)
+                else:
+                    self._log.warning("MCU temp sensor '%s' has no setup_callback method", self.mcu_temp_sensor)
+                self._log.info("Successfully attached MCU temp sensor: %s", self.mcu_temp_sensor)
             except Exception:
                 self._log.exception("Failed to attach MCU temp sensor '%s'", self.mcu_temp_sensor)
 
