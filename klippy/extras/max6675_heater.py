@@ -102,6 +102,9 @@ class Max6675Heater:
             # Optional fan GPIO to cool elements during/after heat
             self.fan_pin = config.get('fan_pin', None)
             self.fan_active_high = bool(config.getboolean('fan_active_high', True))
+            # Names of Klipper [output_pin] objects to drive via SET_PIN
+            self.ssr_output = config.get('ssr_output', 'ssr')
+            self.fan_output = config.get('fan_output', 'element_fan')
             # Optional ambient sensor provided by another module (e.g. aht10/aht20)
             # Example: ambient_sensor: "aht10 my_ambient"
             self.ambient_sensor = config.get('ambient_sensor', None)
@@ -174,49 +177,12 @@ class Max6675Heater:
         # Keep probing only for SSR/FAN capabilities; drop MAX6675 custom probe.
         self._probe_mcu_commands()
 
-        # Optional: attach to ambient sensor (e.g. AHT10/AHT20) on MCU I2C
-        if self.ambient_sensor:
-            try:
-                amb = self.printer.lookup_object(self.ambient_sensor)
-                # Program safe min/max into sensor for basic protection
-                if hasattr(amb, 'setup_minmax'):
-                    amb.setup_minmax(self.min_temp, self.max_temp)
-                if hasattr(amb, 'setup_callback'):
-                    amb.setup_callback(self._on_ambient_sample)
-                self._log.info("Attached ambient sensor: %s", self.ambient_sensor)
-            except Exception:
-                self._log.exception("Failed to attach ambient sensor '%s'", self.ambient_sensor)
+        # Defer sensor attachment until klippy:ready to avoid race with heaters init
+        self._sensors_attached = False
 
-        # Optional: attach to element temperature sensor (built-in temperature_sensor)
-        if self.element_sensor:
-            try:
-                elem = self.printer.lookup_object(self.element_sensor)
-                if hasattr(elem, 'setup_minmax'):
-                    elem.setup_minmax(self.min_temp, self.max_temp)
-                if hasattr(elem, 'setup_callback'):
-                    elem.setup_callback(self._on_element_sample)
-                self._log.info("Attached element sensor: %s", self.element_sensor)
-            except Exception:
-                self._log.exception("Failed to attach element sensor '%s'", self.element_sensor)
-
-        # Optional: attach to MCU internal temperature sensor (temperature_mcu)
-        if self.mcu_temp_sensor:
-            try:
-                mts = self.printer.lookup_object(self.mcu_temp_sensor)
-                if hasattr(mts, 'setup_minmax'):
-                    mts.setup_minmax(self.min_temp, self.max_temp)
-                if hasattr(mts, 'setup_callback'):
-                    mts.setup_callback(self._on_mcu_temp_sample)
-                self._log.info("Attached MCU temp sensor: %s", self.mcu_temp_sensor)
-            except Exception:
-                self._log.exception("Failed to attach MCU temp sensor '%s'", self.mcu_temp_sensor)
-
-        # Threads (only start those that are applicable)
-        self._control_thread = threading.Thread(target=self._control_loop, name='max6675_control', daemon=True)
-        self._control_thread.start()
-
-        self._log_thread = threading.Thread(target=self._log_loop, name='max6675_logger', daemon=True)
-        self._log_thread.start()
+        # Threads (defer start until klippy:ready to let sensors initialize)
+        self._control_thread = None
+        self._log_thread = None
 
         self._log.info('Max6675Heater initialized (hardened)')
 
@@ -254,6 +220,11 @@ class Max6675Heater:
             t = None
         if t is None:
             return
+        # Debug trace to confirm callback activity
+        try:
+            self._log.debug("element_sample: t=%.3f at print_time=%.3f", t, float(print_time or 0.0))
+        except Exception:
+            self._log.debug("element_sample: t=%s at print_time=%s", str(t), str(print_time))
         with self._lock:
             self._element_temp = t
             self._log_accum['elem'].append(t)
@@ -261,6 +232,8 @@ class Max6675Heater:
     def _register_gcodes(self):
         # Register commands with Klipper's gcode object so they're available to users.
         gcode = self.printer.lookup_object('gcode')
+        # Save handle for SET_PIN control
+        self._gcode = gcode
         gcode.register_command('SET_HEATER_TEMP', self.cmd_SET_HEATER_TEMP,
                                desc='Set target temperatures for MAX6675 heater control')
         gcode.register_command('SET_HEATER_POWER', self.cmd_SET_HEATER_POWER,
@@ -273,71 +246,126 @@ class Max6675Heater:
                                desc='Export recent heater telemetry log as CSV via M118 responses')
 
     def _on_ready(self):
+        # Attach sensors (only once)
+        try:
+            if not getattr(self, '_sensors_attached', False):
+                self._attach_sensors()
+                self._sensors_attached = True
+        except Exception:
+            self._log.exception('Failed to attach sensors on ready')
+
+        # Start threads once Klippy reports ready so sensors have begun reporting
+        try:
+            if self._control_thread is None or not self._control_thread.is_alive():
+                self._control_thread = threading.Thread(target=self._control_loop, name='max6675_control', daemon=True)
+                self._control_thread.start()
+            if self._log_thread is None or not self._log_thread.is_alive():
+                self._log_thread = threading.Thread(target=self._log_loop, name='max6675_logger', daemon=True)
+                self._log_thread.start()
+        except Exception:
+            self._log.exception('Failed to start background threads on ready')
         self._log.info('MAX6675 Heater ready')
+
+    def _attach_sensors(self):
+        # Optional: attach to ambient sensor (e.g. AHT10/AHT20) on MCU I2C
+        if self.ambient_sensor:
+            try:
+                amb = self.printer.lookup_object(self.ambient_sensor)
+                if hasattr(amb, 'setup_minmax'):
+                    amb.setup_minmax(self.min_temp, self.max_temp)
+                if hasattr(amb, 'setup_callback'):
+                    amb.setup_callback(self._on_ambient_sample)
+                self._log.info("Attached ambient sensor: %s", self.ambient_sensor)
+            except Exception:
+                self._log.exception("Failed to attach ambient sensor '%s'", self.ambient_sensor)
+
+        # Optional: attach to element temperature sensor (built-in temperature_sensor)
+        if self.element_sensor:
+            try:
+                elem = self.printer.lookup_object(self.element_sensor)
+                if hasattr(elem, 'setup_minmax'):
+                    elem.setup_minmax(self.min_temp, self.max_temp)
+                if hasattr(elem, 'setup_callback'):
+                    elem.setup_callback(self._on_element_sample)
+                    self._log.debug("Registered element sensor callback on '%s'", self.element_sensor)
+                self._log.info("Attached element sensor: %s", self.element_sensor)
+            except Exception:
+                self._log.exception("Failed to attach element sensor '%s'", self.element_sensor)
+
+        # Optional: attach to MCU internal temperature sensor (temperature_mcu)
+        if self.mcu_temp_sensor:
+            try:
+                mts = self.printer.lookup_object(self.mcu_temp_sensor)
+                if hasattr(mts, 'setup_minmax'):
+                    mts.setup_minmax(self.min_temp, self.max_temp)
+                if hasattr(mts, 'setup_callback'):
+                    mts.setup_callback(self._on_mcu_temp_sample)
+                self._log.info("Attached MCU temp sensor: %s", self.mcu_temp_sensor)
+            except Exception:
+                self._log.exception("Failed to attach MCU temp sensor '%s'", self.mcu_temp_sensor)
 
     def _on_idle(self, eventtime):
         # When Klipper considers idle, make sure heater off
         self.set_power(0.0)
 
     def _probe_mcu_commands(self):
-        """Check whether MCU supports the expected commands. This function will
-        attempt lightweight calls and set capability flags. It never raises."""
+        """Probe availability of configured [output_pin] objects via SET_PIN.
+        Sets _mcu_ok, _ssr_ok, _fan_ok flags; never raises."""
         try:
-            # Try sending a small SSR pwm value (don't change real hardware if possible)
+            # Probe SSR output by attempting a harmless SET_PIN to 0.0
             try:
-                self.mcu.send('set_ssr_pwm', value=0)
+                self.printer.lookup_object('pins').lookup_pin(self.ssr_output)
+                self._gcode.run_script(f"SET_PIN PIN={self.ssr_output} VALUE=0")
                 self._ssr_ok = True
             except Exception as e:
-                self._log.debug("set_ssr_pwm probe failed: %s", e)
+                self._log.debug("SET_PIN probe for ssr_output '%s' failed: %s", self.ssr_output, e)
                 self._ssr_ok = False
 
-            # Try probing fan gpio command if configured
-            if self.fan_pin is not None:
+            # Probe fan output (optional)
+            self._fan_ok = False
+            if self.fan_output:
                 try:
-                    # Inform MCU of the fan pin if required by its implementation; if not, this send should still be harmless.
-                    # We assume an MCU command 'fan_gpio_set' that accepts value=0/1 and uses pre-configured pin.
-                    self.mcu.send('fan_gpio_set', value=0)
+                    self.printer.lookup_object('pins').lookup_pin(self.fan_output)
+                    self._gcode.run_script(f"SET_PIN PIN={self.fan_output} VALUE=0")
                     self._fan_ok = True
                 except Exception as e:
-                    self._log.debug("fan_gpio_set probe failed: %s", e)
-                    self._fan_ok = False
+                    self._log.debug("SET_PIN probe for fan_output '%s' failed: %s", self.fan_output, e)
 
-            # Basic mcu reachability
+            # MCU/gcode plumbing reachable
             self._mcu_ok = True
         except Exception as e:
             self._log.warning("MCU probe failed; operating in degraded mode: %s", e)
             self._mcu_ok = False
         if not self._ssr_ok:
-            self._log.warning("set_ssr_pwm not confirmed on MCU; SSR output may not work.")
-        if self.fan_pin is not None and not self._fan_ok:
-            self._log.warning("fan_gpio_set not confirmed on MCU; fan GPIO control disabled.")
+            self._log.warning("SSR output '%s' not available; heater power disabled.", self.ssr_output)
+        if not self._fan_ok and self.fan_output:
+            self._log.warning("Fan output '%s' not available; fan control disabled.", self.fan_output)
 
     def _send_fan_gpio(self, on: bool):
-        """Set fan GPIO state. Honors active-high setting. No-op if not available."""
+        """Set fan via SET_PIN on configured [output_pin]. Honors active-high."""
         desired = bool(on)
-        # Map logical on/off to electrical level
-        level = 1 if (desired == self.fan_active_high) else 0
-        if not self._mcu_ok or not self._fan_ok:
+        level = 1.0 if (desired == self.fan_active_high) else 0.0
+        if not self._mcu_ok or not self._fan_ok or not self.fan_output:
             return
         try:
-            self.mcu.send('fan_gpio_set', value=int(level))
+            self._gcode.run_script(f"SET_PIN PIN={self.fan_output} VALUE={level:.3f}")
             self._fan_on = desired
-        except Exception as e:
-            self._log.debug("Failed to set fan_gpio_set on MCU: %s", e)
+        except Exception:
+            self._log.debug("Failed to SET_PIN for fan_output '%s'", self.fan_output, exc_info=True)
 
 
 
     def _send_ssr_pwm_set(self, value: int):
-        """Set SSR PWM via MCU. value: 0..65535"""
+        """Set SSR power via SET_PIN (value 0..65535 scaled to 0..1)."""
         if not self._mcu_ok or not self._ssr_ok:
-            self._log.debug("Skipping SSR PWM set; MCU/SSR not available.")
+            self._log.debug("Skipping SSR SET_PIN; SSR output unavailable.")
             return
         try:
-            # clamp value defensively
             v = int(max(0, min(65535, int(value))))
-            self.mcu.send('set_ssr_pwm', value=v)
-        except Exception as e:
-            self._log.warning("Failed to set set_ssr_pwm on MCU: %s", e)
+            val = v / 65535.0
+            self._gcode.run_script(f"SET_PIN PIN={self.ssr_output} VALUE={val:.5f}")
+        except Exception:
+            self._log.warning("Failed to SET_PIN for ssr_output '%s'", self.ssr_output, exc_info=True)
 
     
 
@@ -396,7 +424,7 @@ class Max6675Heater:
         throttle_temp = 220.0  # Celsius (throttle - reduce power)
         shutdown_temp = 260.0  # Celsius (hard shutdown)
         runaway_rate = 5.0     # degC/sec
-        sensor_fail_timeout = 10.0  # seconds
+        sensor_fail_timeout = 30.0  # seconds (allow time for sensor to start reporting)
         last_elem_ok = time.time()
         last_elem_temp = None
         last_elem_time = None
