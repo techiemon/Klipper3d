@@ -130,7 +130,8 @@ class Max6675Heater:
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self.heater_power = 0.0
-        self._heater_enabled = True
+        # Safety: heater starts disabled and remains off until explicitly enabled by user
+        self._heater_enabled = False
         self._error = None
 
         # Sensors & logs
@@ -247,6 +248,11 @@ class Max6675Heater:
                                desc='Run PID autotune for MAX6675 heater')
         gcode.register_command('EXPORT_HEATER_LOG', self.cmd_EXPORT_HEATER_LOG,
                                desc='Export recent heater telemetry log as CSV via M118 responses')
+        # Safety control
+        gcode.register_command('ENABLE_HEATER', self.cmd_ENABLE_HEATER,
+                               desc='Enable MAX6675 heater output (does not set power)')
+        gcode.register_command('DISABLE_HEATER', self.cmd_DISABLE_HEATER,
+                               desc='Disable MAX6675 heater output and force power to 0')
 
     def _on_ready(self):
         # Probe outputs now that all config objects are loaded
@@ -394,7 +400,7 @@ class Max6675Heater:
             p = 0.0
         p = max(0.0, min(1.0, p))
         with self._lock:
-            if not getattr(self, '_heater_enabled', True):
+            if not getattr(self, '_heater_enabled', False):
                 p = 0.0
             self.heater_power = p
             self._log_accum['power'].append(p)
@@ -475,26 +481,13 @@ class Max6675Heater:
                 last_elem_temp = element_temp
                 last_elem_time = now
 
-                # Control logic:
-                # If air sensor present and air < target_air -> full power.
-                # Otherwise run PID on element temp towards (air + offset)
-                if (air_temp is not None) and (air_temp < self.target_air):
-                    # full power until ambient warmed
-                    self.set_power(1.0)
-                else:
-                    # compute target for element; if no air, use element_offset relative to previous element temp or target_air
-                    if air_temp is not None:
-                        target_elem = air_temp + self.element_offset
-                    else:
-                        # fallback: if no air reading, keep the setpoint at previous or use element_offset above min_temp
-                        prev_elem = element_temp if element_temp is not None else self.min_temp
-                        target_elem = prev_elem + self.element_offset
-                    # update PID setpoint thread-safely
-                    with self._lock:
-                        self._pid.set_setpoint(target_elem)
-                    # compute using last known element temp (0 if None)
-                    power = self._pid.compute(element_temp or 0.0)
-                    self.set_power(max(0.0, min(1.0, power)))
+                # Safety-first control: never raise power automatically.
+                # Only reflect current manual power if heater is enabled and element sensor is valid;
+                # otherwise force power to 0.
+                if (not self._heater_enabled) or (element_temp is None):
+                    if self.heater_power != 0.0:
+                        self.set_power(0.0)
+                # else: leave power as previously set by SET_HEATER_POWER
 
                 # Post-cooling logic: if heater power is zero and cooling is active, keep fan on
                 # until air and element temps are within cool_ratio of each other.
@@ -559,38 +552,88 @@ class Max6675Heater:
 
     # GCODE handlers (expected to be called by Klipper's event system)
     def cmd_SET_HEATER_TEMP(self, gcmd):
-        temp = gcmd.get_float('S', None)
-        if temp is not None:
-            with self._lock:
-                self.target_air = float(temp)
-                self._heater_enabled = True
-            gcmd.respond_info('Target air temperature set to %.2fC' % temp)
+        """Set target temperatures/offsets (does not enable or apply power)."""
+        air = gcmd.get_float('AIR', None)
+        offset = gcmd.get_float('OFFSET', None)
+        s_val = gcmd.get_float('S', None)  # legacy: treat as AIR if provided
+        changed = False
+        with self._lock:
+            if s_val is not None:
+                self.target_air = float(s_val)
+                changed = True
+            if air is not None:
+                self.target_air = float(air)
+                changed = True
+            if offset is not None:
+                self.element_offset = float(offset)
+                changed = True
+        if changed:
+            gcmd.respond_info('Targets updated: target_air=%.2fC, element_offset=%.2fC' % (
+                float(getattr(self, 'target_air', 0.0)), float(getattr(self, 'element_offset', 0.0))))
+        else:
+            gcmd.respond_info('No changes. Use AIR=<C> and/or OFFSET=<C> (S=<C> sets AIR).')
 
     def cmd_SET_HEATER_POWER(self, gcmd):
-        power = gcmd.get_float('S', None)
-        if power is not None:
-            # Accept either 0..1 or 0..100 (common G-code confusion); auto-detect
-            if power > 1.5:
-                power = power / 100.0
-            self.set_power(power)
-            gcmd.respond_info('Heater power forced to %.2f%%' % (self.heater_power * 100.0))
+        """Set manual heater power. Requires ENABLE_HEATER to take effect."""
+        power = gcmd.get_float('POWER', None)
+        if power is None:
+            power = gcmd.get_float('S', None)
+        if power is None:
+            gcmd.respond_info('Usage: SET_HEATER_POWER POWER=<0..1 or 0..100%> (requires ENABLE_HEATER)')
+            return
+        # Accept percentages if POWER>1
+        if power > 1.0:
+            power = power / 100.0
+        if not self._heater_enabled:
+            # Do not apply power when disabled
+            self.set_power(0.0)
+            gcmd.respond_info('Heater is DISABLED. Run ENABLE_HEATER first; power remains 0%.')
+            return
+        self.set_power(power)
+        gcmd.respond_info('Heater power set to %.2f%%' % (self.heater_power * 100.0))
 
     def cmd_QUERY_HEATER(self, gcmd):
+        """Report current temps, power, enabled state, and any error."""
         with self._lock:
             air_temp = self._aht20_temp if self._aht20_temp is not None else None
             element_temp = self._element_temp if self._element_temp is not None else None
             mcu_temp = self._mcu_temp if self._mcu_temp is not None else None
             humidity = self._aht20_humidity if self._aht20_humidity is not None else None
             power_pct = self.heater_power * 100.0
-            msg = 'Air temp: %s, MCU temp: %s, Humidity: %s, Element temp: %s, Power: %.2f%%' % (
-                ('%.2fC' % air_temp) if air_temp is not None else 'N/A',
-                ('%.2fC' % mcu_temp) if mcu_temp is not None else 'N/A',
-                ('%.1f%%' % humidity) if humidity is not None else 'N/A',
-                ('%.2fC' % element_temp) if element_temp is not None else 'N/A',
-                power_pct)
+            enabled = self._heater_enabled
+            ssr_ok = getattr(self, '_ssr_ok', False)
+            fan_on = getattr(self, '_fan_on', False)
+            msg = (
+                'Enabled: %s, Power: %.2f%%\nAir: %s, Element: %s, MCU: %s, Humidity: %s\nSSR_OK: %s, Fan: %s' % (
+                    'YES' if enabled else 'NO',
+                    power_pct,
+                    ('%.2fC' % air_temp) if air_temp is not None else 'N/A',
+                    ('%.2fC' % element_temp) if element_temp is not None else 'N/A',
+                    ('%.2fC' % mcu_temp) if mcu_temp is not None else 'N/A',
+                    ('%.1f%%' % humidity) if humidity is not None else 'N/A',
+                    'YES' if ssr_ok else 'NO',
+                    'ON' if fan_on else 'OFF')
+            )
             if self._error:
                 msg += '\nERROR: ' + self._error
         gcmd.respond_info(msg)
+
+    def cmd_ENABLE_HEATER(self, gcmd):
+        """Explicitly enable heater output gating (does not set power)."""
+        with self._lock:
+            self._heater_enabled = True
+            # Keep SSR OFF until a positive power is explicitly set
+            self.heater_power = 0.0
+        # Ensure hardware is off until user sends SET_HEATER_POWER
+        self._send_ssr_pwm_set(0)
+        gcmd.respond_info('Heater ENABLED. Power is 0%%. Use SET_HEATER_POWER to apply power.')
+
+    def cmd_DISABLE_HEATER(self, gcmd):
+        """Disable heater output and force power to zero immediately."""
+        with self._lock:
+            self._heater_enabled = False
+        self.set_power(0.0)
+        gcmd.respond_info('Heater DISABLED. Power forced to 0%.')
 
     def cmd_TUNE_HEATER_PID(self, gcmd):
         kp = gcmd.get_float('KP', None)
