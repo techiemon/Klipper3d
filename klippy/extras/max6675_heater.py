@@ -175,7 +175,10 @@ class Max6675Heater:
 
         # Probe MCU commands non-fatally (do not raise on failure; we operate degraded)
         # Keep probing only for SSR/FAN capabilities; drop MAX6675 custom probe.
-        self._probe_mcu_commands()
+        # Defer probing until klippy:ready to ensure all [output_pin] objects are registered
+        # and gcode interfaces are fully initialized. Probing too early can cause false
+        # negatives and leave control flags disabled for the session.
+        # We'll invoke _probe_mcu_commands() in _on_ready().
 
         # Defer sensor attachment until klippy:ready to avoid race with heaters init
         self._sensors_attached = False
@@ -246,6 +249,12 @@ class Max6675Heater:
                                desc='Export recent heater telemetry log as CSV via M118 responses')
 
     def _on_ready(self):
+        # Probe outputs now that all config objects are loaded
+        try:
+            self._probe_mcu_commands()
+        except Exception:
+            self._log.debug('Exception during output probe on ready', exc_info=True)
+
         # Attach sensors (only once)
         try:
             if not getattr(self, '_sensors_attached', False):
@@ -314,7 +323,6 @@ class Max6675Heater:
         try:
             # Probe SSR output by attempting a harmless SET_PIN to 0.0
             try:
-                self.printer.lookup_object('pins').lookup_pin(self.ssr_output)
                 self._gcode.run_script(f"SET_PIN PIN={self.ssr_output} VALUE=0")
                 self._ssr_ok = True
             except Exception as e:
@@ -325,7 +333,6 @@ class Max6675Heater:
             self._fan_ok = False
             if self.fan_output:
                 try:
-                    self.printer.lookup_object('pins').lookup_pin(self.fan_output)
                     self._gcode.run_script(f"SET_PIN PIN={self.fan_output} VALUE=0")
                     self._fan_ok = True
                 except Exception as e:
