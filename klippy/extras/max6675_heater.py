@@ -190,48 +190,43 @@ class Max6675Heater:
 
         self._log.info('Max6675Heater initialized (hardened)')
 
-    def _on_ambient_sample(self, print_time, temp):
-        """Callback from an external ambient sensor (e.g., AHT10/AHT20).
-        Only temperature is provided via callback; humidity, if desired, can be
-        queried from that module's get_status() separately.
-        """
+    def get_mcu_temp(self) -> Optional[float]:
+        """Poll MCU temperature sensor for current temperature."""
+        if self._mcu_temp_sensor_obj is None:
+            return None
         try:
-            t = float(temp) if temp is not None else None
-        except Exception:
-            t = None
-        if t is None:
-            self._log.debug("Ambient sensor callback: temp is None")
-            return
-        self._log.debug("Ambient sensor callback: temp=%.2f°C at print_time=%.3f", t, float(print_time or 0.0))
-        with self._lock:
-            self._aht20_temp = t
-            self._log_accum['air'].append(t)
+            # Get current temperature from sensor object
+            status = self._mcu_temp_sensor_obj.get_status(None)
+            temp = status.get('temperature', None)
+            if temp is not None:
+                temp = float(temp)
+                # Update internal state for logging
+                with self._lock:
+                    self._mcu_temp = temp
+                    self._log_accum['mcu'].append(temp)
+                return temp
+        except Exception as e:
+            self._log.debug("Failed to read MCU temperature: %s", e)
+        return None
 
-    def _on_mcu_temp_sample(self, print_time, temp):
+    def get_humidity(self) -> Optional[float]:
+        """Get humidity from ambient sensor if available."""
+        if self._ambient_sensor_obj is None:
+            return None
         try:
-            t = float(temp) if temp is not None else None
-        except Exception:
-            t = None
-        if t is None:
-            return
-        with self._lock:
-            self._mcu_temp = t
-            self._log_accum['mcu'].append(t)
-
-    def _on_element_sample(self, print_time, temp):
-        """Callback from the built-in temperature_sensor for the element temp."""
-        try:
-            t = float(temp) if temp is not None else None
-        except Exception:
-            t = None
-        if t is None:
-            self._log.debug("Element sensor callback: temp is None")
-            return
-        # Debug trace to confirm callback activity
-        self._log.debug("Element sensor callback: temp=%.2f°C at print_time=%.3f", t, float(print_time or 0.0))
-        with self._lock:
-            self._element_temp = t
-            self._log_accum['elem'].append(t)
+            # Try to get humidity from sensor status
+            status = self._ambient_sensor_obj.get_status(None)
+            humidity = status.get('humidity', None)
+            if humidity is not None:
+                humidity = float(humidity)
+                # Update internal state for logging
+                with self._lock:
+                    self._aht20_humidity = humidity
+                    self._log_accum['hum'].append(humidity)
+                return humidity
+        except Exception as e:
+            self._log.debug("Failed to read humidity: %s", e)
+        return None
 
     def _register_gcodes(self):
         # Register commands with Klipper's gcode object so they're available to users.
@@ -282,6 +277,11 @@ class Max6675Heater:
         self._log.info('MAX6675 Heater ready')
 
     def _attach_sensors(self):
+        # Store sensor object references for polling instead of callbacks
+        self._ambient_sensor_obj = None
+        self._element_sensor_obj = None
+        self._mcu_temp_sensor_obj = None
+        
         # Optional: attach to ambient sensor (e.g. AHT10/AHT20) on MCU I2C
         if self.ambient_sensor:
             try:
@@ -291,11 +291,8 @@ class Max6675Heater:
                 if hasattr(amb, 'setup_minmax'):
                     amb.setup_minmax(self.min_temp, self.max_temp)
                     self._log.debug("Set minmax on ambient sensor")
-                if hasattr(amb, 'setup_callback'):
-                    amb.setup_callback(self._on_ambient_sample)
-                    self._log.info("Registered ambient sensor callback on '%s'", self.ambient_sensor)
-                else:
-                    self._log.warning("Ambient sensor '%s' has no setup_callback method", self.ambient_sensor)
+                # Store reference for polling
+                self._ambient_sensor_obj = amb
                 self._log.info("Successfully attached ambient sensor: %s", self.ambient_sensor)
             except Exception:
                 self._log.exception("Failed to attach ambient sensor '%s'", self.ambient_sensor)
@@ -309,11 +306,8 @@ class Max6675Heater:
                 if hasattr(elem, 'setup_minmax'):
                     elem.setup_minmax(self.min_temp, self.max_temp)
                     self._log.debug("Set minmax on element sensor")
-                if hasattr(elem, 'setup_callback'):
-                    elem.setup_callback(self._on_element_sample)
-                    self._log.info("Registered element sensor callback on '%s'", self.element_sensor)
-                else:
-                    self._log.warning("Element sensor '%s' has no setup_callback method", self.element_sensor)
+                # Store reference for polling
+                self._element_sensor_obj = elem
                 self._log.info("Successfully attached element sensor: %s", self.element_sensor)
             except Exception:
                 self._log.exception("Failed to attach element sensor '%s'", self.element_sensor)
@@ -327,11 +321,8 @@ class Max6675Heater:
                 if hasattr(mts, 'setup_minmax'):
                     mts.setup_minmax(self.min_temp, self.max_temp)
                     self._log.debug("Set minmax on MCU temp sensor")
-                if hasattr(mts, 'setup_callback'):
-                    mts.setup_callback(self._on_mcu_temp_sample)
-                    self._log.info("Registered MCU temp sensor callback on '%s'", self.mcu_temp_sensor)
-                else:
-                    self._log.warning("MCU temp sensor '%s' has no setup_callback method", self.mcu_temp_sensor)
+                # Store reference for polling
+                self._mcu_temp_sensor_obj = mts
                 self._log.info("Successfully attached MCU temp sensor: %s", self.mcu_temp_sensor)
             except Exception:
                 self._log.exception("Failed to attach MCU temp sensor '%s'", self.mcu_temp_sensor)
@@ -400,14 +391,42 @@ class Max6675Heater:
     
 
     def get_air_temp(self) -> Optional[float]:
-        with self._lock:
-            val = self._aht20_temp
-            # accumulators are updated in ambient callback or local sensor thread
-            return None if val is None else float(val)
+        """Poll ambient sensor for current temperature."""
+        if self._ambient_sensor_obj is None:
+            return None
+        try:
+            # Get current temperature from sensor object
+            status = self._ambient_sensor_obj.get_status(None)
+            temp = status.get('temperature', None)
+            if temp is not None:
+                temp = float(temp)
+                # Update internal state for logging
+                with self._lock:
+                    self._aht20_temp = temp
+                    self._log_accum['air'].append(temp)
+                return temp
+        except Exception as e:
+            self._log.debug("Failed to read ambient temperature: %s", e)
+        return None
 
     def get_element_temp(self) -> Optional[float]:
-        with self._lock:
-            return None if self._element_temp is None else float(self._element_temp)
+        """Poll element sensor for current temperature."""
+        if self._element_sensor_obj is None:
+            return None
+        try:
+            # Get current temperature from sensor object
+            status = self._element_sensor_obj.get_status(None)
+            temp = status.get('temperature', None)
+            if temp is not None:
+                temp = float(temp)
+                # Update internal state for logging
+                with self._lock:
+                    self._element_temp = temp
+                    self._log_accum['elem'].append(temp)
+                return temp
+        except Exception as e:
+            self._log.debug("Failed to read element temperature: %s", e)
+        return None
 
     def set_power(self, power):
         """Set heater power as 0.0..1.0 (floats); thread-safe and non-blocking."""
@@ -611,28 +630,32 @@ class Max6675Heater:
 
     def cmd_QUERY_HEATER(self, gcmd):
         """Report current temps, power, enabled state, and any error."""
+        # Poll sensors for current readings
+        air_temp = self.get_air_temp()
+        element_temp = self.get_element_temp()
+        mcu_temp = self.get_mcu_temp()
+        humidity = self.get_humidity()
+        
         with self._lock:
-            air_temp = self._aht20_temp if self._aht20_temp is not None else None
-            element_temp = self._element_temp if self._element_temp is not None else None
-            mcu_temp = self._mcu_temp if self._mcu_temp is not None else None
-            humidity = self._aht20_humidity if self._aht20_humidity is not None else None
             power_pct = self.heater_power * 100.0
             enabled = self._heater_enabled
             ssr_ok = getattr(self, '_ssr_ok', False)
             fan_on = getattr(self, '_fan_on', False)
-            msg = (
-                'Enabled: %s, Power: %.2f%%\nAir: %s, Element: %s, MCU: %s, Humidity: %s\nSSR_OK: %s, Fan: %s' % (
-                    'YES' if enabled else 'NO',
-                    power_pct,
-                    ('%.2fC' % air_temp) if air_temp is not None else 'N/A',
-                    ('%.2fC' % element_temp) if element_temp is not None else 'N/A',
-                    ('%.2fC' % mcu_temp) if mcu_temp is not None else 'N/A',
-                    ('%.1f%%' % humidity) if humidity is not None else 'N/A',
-                    'YES' if ssr_ok else 'NO',
-                    'ON' if fan_on else 'OFF')
-            )
-            if self._error:
-                msg += '\nERROR: ' + self._error
+            error = self._error
+            
+        msg = (
+            'Enabled: %s, Power: %.2f%%\nAir: %s, Element: %s, MCU: %s, Humidity: %s\nSSR_OK: %s, Fan: %s' % (
+                'YES' if enabled else 'NO',
+                power_pct,
+                ('%.2fC' % air_temp) if air_temp is not None else 'N/A',
+                ('%.2fC' % element_temp) if element_temp is not None else 'N/A',
+                ('%.2fC' % mcu_temp) if mcu_temp is not None else 'N/A',
+                ('%.1f%%' % humidity) if humidity is not None else 'N/A',
+                'YES' if ssr_ok else 'NO',
+                'ON' if fan_on else 'OFF')
+        )
+        if error:
+            msg += '\nERROR: ' + error
         gcmd.respond_info(msg)
 
     def cmd_ENABLE_HEATER(self, gcmd):
