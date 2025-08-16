@@ -71,11 +71,11 @@ class PID:
         self._last_time = None
 
 
-class Max6675Heater:
+class RP2040PrecisionCabinetHeater:
     def __init__(self, config):
         # Basic klipper plumbing
         self.printer = config.get_printer()
-        self._log = logging.getLogger('max6675_heater')
+        self._log = logging.getLogger('rp2040_precision_cabinet_heater')
 
         # Validate config fields, raise helpful errors
         try:
@@ -194,7 +194,7 @@ class Max6675Heater:
         self._control_thread = None
         self._log_thread = None
 
-        self._log.info('Max6675Heater initialized (hardened)')
+        self._log.info('RP2040PrecisionCabinetHeater initialized (hardened)')
 
     def get_mcu_temp(self) -> Optional[float]:
         """Poll MCU temperature sensor for current temperature."""
@@ -265,21 +265,20 @@ class Max6675Heater:
         gcode = self.printer.lookup_object('gcode')
         # Save handle for SET_PIN control
         self._gcode = gcode
-        gcode.register_command('SET_HEATER_TEMP', self.cmd_SET_HEATER_TEMP,
-                               desc='Set target temperatures for MAX6675 heater control')
-        gcode.register_command('SET_HEATER_POWER', self.cmd_SET_HEATER_POWER,
-                               desc='Manually set heater power (0.0-1.0) for MAX6675 heater')
-        gcode.register_command('QUERY_HEATER', self.cmd_QUERY_HEATER,
-                               desc='Query current heater, air, and MCU temperatures and state')
-        gcode.register_command('TUNE_HEATER_PID', self.cmd_TUNE_HEATER_PID,
-                               desc='Run PID autotune for MAX6675 heater')
-        gcode.register_command('EXPORT_HEATER_LOG', self.cmd_EXPORT_HEATER_LOG,
-                               desc='Export recent heater telemetry log as CSV via M118 responses')
-        # Safety control
-        gcode.register_command('ENABLE_HEATER', self.cmd_ENABLE_HEATER,
-                               desc='Enable MAX6675 heater output (does not set power)')
-        gcode.register_command('DISABLE_HEATER', self.cmd_DISABLE_HEATER,
-                               desc='Disable MAX6675 heater output and force power to 0')
+        self._gcode.register_command('SET_CABINET_HEATER_TEMP', self.cmd_SET_CABINET_HEATER_TEMP,
+                                     desc='Set target temperatures/offsets')
+        self._gcode.register_command('SET_CABINET_HEATER_POWER', self.cmd_SET_CABINET_HEATER_POWER,
+                                     desc='Manual power control disabled - uses automatic PID')
+        self._gcode.register_command('QUERY_CABINET_HEATER', self.cmd_QUERY_CABINET_HEATER,
+                                     desc='Report current temps, power, enabled state')
+        self._gcode.register_command('ENABLE_CABINET_HEATER', self.cmd_ENABLE_CABINET_HEATER,
+                                     desc='Enable cabinet heater output gating')
+        self._gcode.register_command('DISABLE_CABINET_HEATER', self.cmd_DISABLE_CABINET_HEATER,
+                                     desc='Disable cabinet heater output gating')
+        self._gcode.register_command('CABINET_HEATER_LOG', self.cmd_CABINET_HEATER_LOG,
+                                     desc='Export temperature log as CSV')
+        self._gcode.register_command('CABINET_HEATER_HELP', self.cmd_CABINET_HEATER_HELP,
+                                     desc='Show all cabinet heater commands and usage')
 
     def _on_ready(self):
         # Probe outputs now that all config objects are loaded
@@ -527,7 +526,7 @@ class Max6675Heater:
                 # Sensor fail detection
                 if element_temp is None:
                     if now - last_elem_ok > sensor_fail_timeout:
-                        self._shutdown_heater('MAX6675 sensor failure: no reading for %.1f s' % sensor_fail_timeout)
+                        self._shutdown_cabinet('MAX6675 sensor failure: no reading for %.1f s' % sensor_fail_timeout)
                         break
                 else:
                     last_elem_ok = now
@@ -535,7 +534,7 @@ class Max6675Heater:
                 # Overtemp checks
                 if element_temp is not None:
                     if element_temp > shutdown_temp:
-                        self._shutdown_heater('Element temperature exceeded %dC (%.2fC)' % (shutdown_temp, element_temp))
+                        self._shutdown_cabinet('Element temperature exceeded %dC (%.2fC)' % (shutdown_temp, element_temp))
                         break
                     if element_temp > throttle_temp:
                         # throttle: temporarily stop heating and re-evaluate
@@ -551,7 +550,7 @@ class Max6675Heater:
                     if dt > 0:
                         rate = (element_temp - last_elem_temp) / dt
                         if rate > runaway_rate:
-                            self._shutdown_heater('Thermal runaway detected: rate %.2f C/s' % rate)
+                            self._shutdown_cabinet('Thermal runaway detected: rate %.2f C/s' % rate)
                             break
                 last_elem_temp = element_temp
                 last_elem_time = now
@@ -604,7 +603,7 @@ class Max6675Heater:
             except Exception as e:
                 self._log.exception("Exception in control loop: %s", e)
                 # On unexpected error, do not crash the process; put heater into safe-off state
-                self._shutdown_heater("Control loop fatal error: %s" % e)
+                self._shutdown_cabinet("Control loop fatal error: %s" % e)
                 break
 
             # Wait until next sample period but respond to stop_event quickly
@@ -643,7 +642,7 @@ class Max6675Heater:
                 self._stop_event.wait(1.0)
 
     # GCODE handlers (expected to be called by Klipper's event system)
-    def cmd_SET_HEATER_TEMP(self, gcmd):
+    def cmd_SET_CABINET_HEATER_TEMP(self, gcmd):
         """Set target temperatures/offsets (does not enable or apply power)."""
         air = gcmd.get_float('AIR', None)
         offset = gcmd.get_float('OFFSET', None)
@@ -665,13 +664,13 @@ class Max6675Heater:
         else:
             gcmd.respond_info('No changes. Use AIR=<C> and/or OFFSET=<C> (S=<C> sets AIR).')
 
-    def cmd_SET_HEATER_POWER(self, gcmd):
+    def cmd_SET_CABINET_HEATER_POWER(self, gcmd):
         """Manual power control is disabled - heater uses automatic PID control."""
         gcmd.respond_info('Manual power control is disabled. This heater uses automatic PID control.')
-        gcmd.respond_info('Use SET_HEATER_TEMP to set target temperature, ENABLE_HEATER to start.')
+        gcmd.respond_info('Use SET_CABINET_HEATER_TEMP to set target temperature, ENABLE_CABINET_HEATER to start.')
         gcmd.respond_info('The PID controller will automatically manage heater power to maintain temperature.')
 
-    def cmd_QUERY_HEATER(self, gcmd):
+    def cmd_QUERY_CABINET_HEATER(self, gcmd):
         """Report current temps, power, enabled state, and any error."""
         # Poll sensors for current readings
         air_temp = self.get_air_temp()
@@ -701,7 +700,7 @@ class Max6675Heater:
             msg += '\nERROR: ' + error
         gcmd.respond_info(msg)
 
-    def cmd_ENABLE_HEATER(self, gcmd):
+    def cmd_ENABLE_CABINET_HEATER(self, gcmd):
         """Explicitly enable heater output gating (does not set power)."""
         with self._lock:
             self._heater_enabled = True
@@ -709,33 +708,16 @@ class Max6675Heater:
             self.heater_power = 0.0
         # Ensure hardware is off until user sends SET_HEATER_POWER
         self._send_ssr_pwm_set(0)
-        gcmd.respond_info('Heater ENABLED. Power is 0%%. Use SET_HEATER_POWER to apply power.')
+        gcmd.respond_info('Cabinet heater ENABLED. PID control active. Use SET_CABINET_HEATER_TEMP to set target.')
 
-    def cmd_DISABLE_HEATER(self, gcmd):
+    def cmd_DISABLE_CABINET_HEATER(self, gcmd):
         """Disable heater output and force power to zero immediately."""
         with self._lock:
             self._heater_enabled = False
         self.set_power(0.0)
-        gcmd.respond_info('Heater DISABLED. Power forced to 0%.')
+        gcmd.respond_info('Cabinet heater DISABLED. Power forced to 0%.')
 
-    def cmd_TUNE_HEATER_PID(self, gcmd):
-        kp = gcmd.get_float('KP', None)
-        ki = gcmd.get_float('KI', None)
-        kd = gcmd.get_float('KD', None)
-        changed = False
-        with self._lock:
-            if kp is not None:
-                self._pid.kp = float(kp)
-                changed = True
-            if ki is not None:
-                self._pid.ki = float(ki)
-                changed = True
-            if kd is not None:
-                self._pid.kd = float(kd)
-                changed = True
-        gcmd.respond_info('PID updated: Kp=%.3f Ki=%.3f Kd=%.3f' % (self._pid.kp, self._pid.ki, self._pid.kd))
-
-    def cmd_EXPORT_HEATER_LOG(self, gcmd):
+    def cmd_CABINET_HEATER_LOG(self, gcmd):
         """Return CSV-like aggregated log data. Handles missing values gracefully."""
         lines = ["timestamp,avg_power,avg_air,avg_mcu,avg_element,avg_humidity"]
         with self._lock:
@@ -755,10 +737,46 @@ class Max6675Heater:
                 lines.append(f"ERROR: {self._error}")
         gcmd.respond_info("\n".join(lines))
 
-    def _shutdown_heater(self, reason):
-        """Put the heater into safe state and stop background threads.
-        This method is re-entrant and thread-safe.
-        """
+    def cmd_CABINET_HEATER_HELP(self, gcmd):
+        """Show all cabinet heater commands and usage examples."""
+        help_text = [
+            "=== RP2040 Precision Cabinet Heater Commands ===",
+            "",
+            "BASIC USAGE:",
+            "  SET_CABINET_HEATER_TEMP S=35     # Set target temperature to 35°C",
+            "  ENABLE_CABINET_HEATER            # Start PID control",
+            "  QUERY_CABINET_HEATER             # Check status and temperatures",
+            "  DISABLE_CABINET_HEATER           # Stop heater and turn off",
+            "",
+            "ADVANCED COMMANDS:",
+            "  SET_CABINET_HEATER_TEMP AIR=35 OFFSET=10  # Set air temp and element offset",
+            "  CABINET_HEATER_LOG               # Export temperature log as CSV",
+            "  CABINET_HEATER_HELP              # Show this help",
+            "",
+            "AUTOMATIC PID CONTROL:",
+            "  - System automatically manages heater power (0-100%)",
+            "  - Starts aggressive (high power) when cold",
+            "  - Gradually reduces power as temperature approaches target",
+            "  - Maintains with minimal power (5-15%) at target",
+            "  - Automatically shuts off if ambient exceeds target",
+            "",
+            "SAFETY FEATURES:",
+            "  - Overtemperature shutdown (260°C element limit)",
+            "  - Thermal runaway detection (5°C/sec rate limit)", 
+            "  - Sensor failure detection (30s timeout)",
+            "  - Smart fan control during heating and cooldown",
+            "",
+            "SENSORS:",
+            "  - MAX6675 thermocouple for element temperature",
+            "  - AHT10/AHT20 for ambient temperature and humidity",
+            "  - RP2040 MCU internal temperature sensor",
+            "",
+            "For more info: https://github.com/techiemon/Klipper3d"
+        ]
+        gcmd.respond_info("\n".join(help_text))
+
+    def _shutdown_cabinet(self, reason):
+        """Shutdown cabinet heater due to error and log the reason."""
         with self._lock:
             self._heater_enabled = False
             self.heater_power = 0.0
@@ -768,7 +786,7 @@ class Max6675Heater:
             self._send_ssr_pwm_set(0)
         except Exception:
             pass
-        self._log.warning('Heater shutdown: %s', reason)
+        self._log.error('Cabinet heater shutdown: %s', reason)
         # stop threads
         self._stop_event.set()
 
@@ -795,4 +813,4 @@ class Max6675Heater:
             self._log.debug("Exception while joining threads during shutdown", exc_info=True)
 
 def load_config(config):
-    return Max6675Heater(config)
+    return RP2040PrecisionCabinetHeater(config)
