@@ -524,13 +524,30 @@ class Max6675Heater:
                 last_elem_temp = element_temp
                 last_elem_time = now
 
-                # Safety-first control: never raise power automatically.
-                # Only reflect current manual power if heater is enabled and element sensor is valid;
-                # otherwise force power to 0.
+                # PID-based automatic temperature control
                 if (not self._heater_enabled) or (element_temp is None):
+                    # Safety: force power to 0 if disabled or sensor failed
                     if self.heater_power != 0.0:
                         self.set_power(0.0)
-                # else: leave power as previously set by SET_HEATER_POWER
+                        self._pid.reset()  # Reset PID when disabled to prevent windup
+                elif air_temp is not None and hasattr(self, 'target_air'):
+                    # Automatic PID control: calculate power needed to reach target
+                    self._pid.setpoint = self.target_air
+                    pid_output = self._pid(air_temp)  # PID returns 0.0-1.0 power
+                    
+                    # Clamp PID output to safe range
+                    pid_power = max(0.0, min(1.0, pid_output))
+                    
+                    # Apply PID-calculated power
+                    if abs(pid_power - self.heater_power) > 0.01:  # Only update if significant change
+                        self.set_power(pid_power)
+                        self._log.debug("PID control: air=%.2fC, target=%.2fC, error=%.2fC, power=%.1f%%", 
+                                      air_temp, self.target_air, self.target_air - air_temp, pid_power * 100)
+                else:
+                    # No target set or no ambient sensor: turn off heater
+                    if self.heater_power != 0.0:
+                        self.set_power(0.0)
+                        self._log.debug("No target temperature set or no ambient sensor, heater off")
 
                 # Post-cooling logic: if heater power is zero and cooling is active, keep fan on
                 # until air and element temps are within cool_ratio of each other.
@@ -617,23 +634,10 @@ class Max6675Heater:
             gcmd.respond_info('No changes. Use AIR=<C> and/or OFFSET=<C> (S=<C> sets AIR).')
 
     def cmd_SET_HEATER_POWER(self, gcmd):
-        """Set manual heater power. Requires ENABLE_HEATER to take effect."""
-        power = gcmd.get_float('POWER', None)
-        if power is None:
-            power = gcmd.get_float('S', None)
-        if power is None:
-            gcmd.respond_info('Usage: SET_HEATER_POWER POWER=<0..1 or 0..100%> (requires ENABLE_HEATER)')
-            return
-        # Accept percentages if POWER>1
-        if power > 1.0:
-            power = power / 100.0
-        if not self._heater_enabled:
-            # Do not apply power when disabled
-            self.set_power(0.0)
-            gcmd.respond_info('Heater is DISABLED. Run ENABLE_HEATER first; power remains 0%.')
-            return
-        self.set_power(power)
-        gcmd.respond_info('Heater power set to %.2f%%' % (self.heater_power * 100.0))
+        """Manual power control is disabled - heater uses automatic PID control."""
+        gcmd.respond_info('Manual power control is disabled. This heater uses automatic PID control.')
+        gcmd.respond_info('Use SET_HEATER_TEMP to set target temperature, ENABLE_HEATER to start.')
+        gcmd.respond_info('The PID controller will automatically manage heater power to maintain temperature.')
 
     def cmd_QUERY_HEATER(self, gcmd):
         """Report current temps, power, enabled state, and any error."""
