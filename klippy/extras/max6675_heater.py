@@ -218,10 +218,14 @@ class Max6675Heater:
     def get_humidity(self) -> Optional[float]:
         """Get humidity from ambient sensor if available."""
         if self._ambient_sensor_obj is None:
+            self._log.debug("No ambient sensor object available for humidity")
             return None
         try:
             # Try to get humidity from sensor status
             status = self._ambient_sensor_obj.get_status(None)
+            self._log.debug("Ambient sensor status: %s", status)
+            
+            # First try direct humidity field
             humidity = status.get('humidity', None)
             if humidity is not None:
                 humidity = float(humidity)
@@ -230,8 +234,30 @@ class Max6675Heater:
                     self._aht20_humidity = humidity
                     self._log_accum['hum'].append(humidity)
                 return humidity
+            
+            # If temperature_sensor wrapper doesn't expose humidity, try to access underlying sensor
+            if hasattr(self._ambient_sensor_obj, 'sensor'):
+                underlying_sensor = self._ambient_sensor_obj.sensor
+                if hasattr(underlying_sensor, 'humidity'):
+                    humidity = float(underlying_sensor.humidity)
+                    # Update internal state for logging
+                    with self._lock:
+                        self._aht20_humidity = humidity
+                        self._log_accum['hum'].append(humidity)
+                    return humidity
+                elif hasattr(underlying_sensor, 'get_status'):
+                    underlying_status = underlying_sensor.get_status(None)
+                    humidity = underlying_status.get('humidity', None)
+                    if humidity is not None:
+                        humidity = float(humidity)
+                        # Update internal state for logging
+                        with self._lock:
+                            self._aht20_humidity = humidity
+                            self._log_accum['hum'].append(humidity)
+                        return humidity
+                        
         except Exception as e:
-            self._log.debug("Failed to read humidity: %s", e)
+            self._log.warning("Failed to read humidity: %s", e)
         return None
 
     def _register_gcodes(self):
