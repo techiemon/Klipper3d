@@ -64,6 +64,12 @@ class PID:
         self._last_error = 0.0
         self._last_time = None
 
+    def reset(self):
+        """Reset PID state to prevent windup when disabled/re-enabled."""
+        self._integral = 0.0
+        self._last_error = 0.0
+        self._last_time = None
+
 
 class Max6675Heater:
     def __init__(self, config):
@@ -532,8 +538,8 @@ class Max6675Heater:
                         self._pid.reset()  # Reset PID when disabled to prevent windup
                 elif air_temp is not None and hasattr(self, 'target_air'):
                     # Automatic PID control: calculate power needed to reach target
-                    self._pid.setpoint = self.target_air
-                    pid_output = self._pid(air_temp)  # PID returns 0.0-1.0 power
+                    self._pid.set_setpoint(self.target_air)
+                    pid_output = self._pid.compute(air_temp)  # PID returns 0.0-1.0 power
                     
                     # Clamp PID output to safe range
                     pid_power = max(0.0, min(1.0, pid_output))
