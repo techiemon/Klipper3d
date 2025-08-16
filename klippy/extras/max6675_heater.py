@@ -369,10 +369,13 @@ class Max6675Heater:
         if not self._mcu_ok or not self._fan_ok or not self.fan_output:
             return
         try:
-            self._gcode.run_script(f"SET_PIN PIN={self.fan_output} VALUE={level:.3f}")
+            # Use run_script_from_command to avoid blocking the calling thread
+            cmd = f"SET_PIN PIN={self.fan_output} VALUE={level:.3f}"
+            self._log.debug("Sending fan command: %s", cmd)
+            self._gcode.run_script_from_command(cmd)
             self._fan_on = desired
-        except Exception:
-            self._log.debug("Failed to SET_PIN for fan_output '%s'", self.fan_output, exc_info=True)
+        except Exception as e:
+            self._log.debug("Failed to SET_PIN for fan_output '%s': %s", self.fan_output, e)
 
 
 
@@ -384,9 +387,13 @@ class Max6675Heater:
         try:
             v = int(max(0, min(65535, int(value))))
             val = v / 65535.0
-            self._gcode.run_script(f"SET_PIN PIN={self.ssr_output} VALUE={val:.5f}")
-        except Exception:
-            self._log.warning("Failed to SET_PIN for ssr_output '%s'", self.ssr_output, exc_info=True)
+            # Use run_script_from_command to avoid blocking the calling thread
+            # This prevents QUERY_HEATER from hanging when SET_HEATER_POWER is called
+            cmd = f"SET_PIN PIN={self.ssr_output} VALUE={val:.5f}"
+            self._log.debug("Sending SSR command: %s", cmd)
+            self._gcode.run_script_from_command(cmd)
+        except Exception as e:
+            self._log.warning("Failed to SET_PIN for ssr_output '%s': %s", self.ssr_output, e)
 
     
 
