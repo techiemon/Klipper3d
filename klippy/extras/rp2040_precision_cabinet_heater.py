@@ -394,9 +394,9 @@ class RP2040PrecisionCabinetHeater:
             self._log.warning("Fan output '%s' not available; fan control disabled.", self.fan_output)
 
     def _send_fan_gpio(self, on: bool):
-        """Set fan via SET_PIN on configured [output_pin]. Honors active-high."""
+        """Set fan via SET_PIN on configured [output_pin]. Pin inversion handled by Klipper config."""
         desired = bool(on)
-        level = 1.0 if (desired == self.fan_active_high) else 0.0
+        level = 1.0 if desired else 0.0
         if not self._mcu_ok or not self._fan_ok or not self.fan_output:
             return
         try:
