@@ -277,6 +277,8 @@ class RP2040PrecisionCabinetHeater:
                                      desc='Disable cabinet heater output gating')
         self._gcode.register_command('CABINET_HEATER_LOG', self.cmd_CABINET_HEATER_LOG,
                                      desc='Export temperature log as CSV')
+        self._gcode.register_command('DEBUG_COOLDOWN', self.cmd_DEBUG_COOLDOWN,
+                                     desc='Debug cooldown logic state')
         self._gcode.register_command('CABINET_HEATER_HELP', self.cmd_CABINET_HEATER_HELP,
                                      desc='Show all cabinet heater commands and usage')
 
@@ -718,7 +720,50 @@ class RP2040PrecisionCabinetHeater:
         with self._lock:
             self._heater_enabled = False
         self.set_power(0.0)
-        gcmd.respond_info('Cabinet heater DISABLED. Power forced to 0%.')
+        
+        # Explicitly trigger cooldown if sensors available
+        air_temp = self.get_air_temp()
+        elem_temp = self.get_element_temp()
+        if (air_temp is not None) and (elem_temp is not None):
+            with self._lock:
+                self._cooling_active = True
+            if not self._fan_on:
+                self._send_fan_gpio(True)
+            gcmd.respond_info('Cabinet heater DISABLED. Fan cooling active until temps converge.')
+        else:
+            gcmd.respond_info('Cabinet heater DISABLED. Power forced to 0%.')
+
+    def cmd_DEBUG_COOLDOWN(self, gcmd):
+        """Debug cooldown logic state and calculations."""
+        air_temp = self.get_air_temp()
+        elem_temp = self.get_element_temp()
+        
+        with self._lock:
+            cooling_active = self._cooling_active
+            fan_on = self._fan_on
+            power = self.heater_power
+        
+        if (air_temp is not None) and (elem_temp is not None):
+            high = max(air_temp, elem_temp)
+            diff = abs(elem_temp - air_temp) / high if high > 0 else 0
+            should_stop = diff <= self.cool_ratio
+            
+            msg = (
+                'COOLDOWN DEBUG:\n'
+                'Air: %.1f°C, Element: %.1f°C\n'
+                'Temp diff: %.3f (%.1f%%), Threshold: %.3f (%.1f%%)\n'
+                'Power: %.1f%%, Cooling Active: %s, Fan: %s\n'
+                'Should stop fan: %s'
+            ) % (
+                air_temp, elem_temp,
+                diff, diff * 100, self.cool_ratio, self.cool_ratio * 100,
+                power * 100, cooling_active, fan_on,
+                should_stop
+            )
+        else:
+            msg = 'COOLDOWN DEBUG: Missing sensor data (air=%s, elem=%s)' % (air_temp, elem_temp)
+        
+        gcmd.respond_info(msg)
 
     def cmd_CABINET_HEATER_LOG(self, gcmd):
         """Return CSV-like aggregated log data. Handles missing values gracefully."""
