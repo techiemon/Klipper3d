@@ -587,8 +587,11 @@ class RP2040PrecisionCabinetHeater:
                         high = max(air_temp, element_temp)
                         if high > 0:
                             diff = abs(element_temp - air_temp) / high
+                            self._log.debug("Cooldown check: air=%.1f, elem=%.1f, diff=%.3f, ratio=%.3f", 
+                                          air_temp, element_temp, diff, self.cool_ratio)
                             if diff <= self.cool_ratio:
                                 # Temps have converged; stop fan and end cooling
+                                self._log.info("Temperatures converged (diff=%.3f <= %.3f), stopping fan", diff, self.cool_ratio)
                                 if self._fan_on:
                                     self._send_fan_gpio(False)
                                 self._cooling_active = False
