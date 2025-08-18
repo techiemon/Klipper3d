@@ -597,9 +597,10 @@ class RP2040PrecisionCabinetHeater:
                                 if self._fan_on:
                                     self._send_fan_gpio(False)
                                 self._cooling_active = False
-                        # Ensure fan remains on during cooling
-                        if not self._fan_on:
-                            self._send_fan_gpio(True)
+                            else:
+                                # Ensure fan remains on during cooling
+                                if not self._fan_on:
+                                    self._send_fan_gpio(True)
                     else:
                         # Missing sensors -> cancel cooling and stop fan
                         if self._fan_on:
