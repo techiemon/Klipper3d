@@ -43,6 +43,7 @@ class FilamentCutter:
         # Timing configuration
         self.operation_timeout = config.getfloat('operation_timeout', 120.0)  # 2 minutes default
         self.endstop_timeout = config.getfloat('endstop_timeout', 30.0)      # 30 seconds for endstop
+        self.debounce_time = config.getfloat('debounce_time', 0.050)         # 50ms debounce default
         
         # State variables
         self.state = "IDLE"  # IDLE, MOVING_TO_PARK, MOVING_TO_CUT, PARKING, ERROR
@@ -115,15 +116,53 @@ class FilamentCutter:
         self.reverse_pin_obj.set_digital(1)
 
     def _is_at_park(self):
-        """Check if cutter is at park position"""
-        return self.park_endstop_obj.query_endstop(self.reactor.monotonic())
+        """Check if cutter is at park position with debouncing"""
+        return self._debounced_endstop_check(self.park_endstop_obj)
 
     def _is_at_cut(self):
-        """Check if cutter is at cut position"""
-        return self.cut_endstop_obj.query_endstop(self.reactor.monotonic())
+        """Check if cutter is at cut position with debouncing"""
+        return self._debounced_endstop_check(self.cut_endstop_obj)
+
+    def _debounced_endstop_check(self, endstop_obj):
+        """Check endstop state with majority-time debouncing for noisy switches"""
+        current_time = self.reactor.monotonic()
+        initial_state = endstop_obj.query_endstop(current_time)
+        
+        # If not triggered initially, return immediately
+        if not initial_state:
+            return False
+        
+        # Track state over debounce period using majority time algorithm
+        start_time = current_time
+        on_time = 0.0
+        last_check_time = start_time
+        last_state = initial_state
+        
+        # Sample every 2ms for 50ms window
+        sample_interval = 0.002
+        
+        while (current_time - start_time) < self.debounce_time:
+            self.reactor.pause(sample_interval)
+            current_time = self.reactor.monotonic()
+            current_state = endstop_obj.query_endstop(current_time)
+            
+            # Add time to on_time if previous state was ON
+            if last_state:
+                on_time += (current_time - last_check_time)
+            
+            last_check_time = current_time
+            last_state = current_state
+        
+        # Add final period if still ON
+        if last_state:
+            on_time += (current_time - last_check_time)
+        
+        # Return True if ON for majority of the debounce period
+        majority_threshold = self.debounce_time * 0.5
+        return on_time > majority_threshold
 
     def _wait_for_endstop(self, endstop_obj, timeout, description):
-        """Wait for endstop to be triggered with timeout"""
+        """Wait for endstop to be triggered with timeout and debouncing"""
         start_time = self.reactor.monotonic()
         
         while True:
@@ -134,7 +173,8 @@ class FilamentCutter:
             if current_time - start_time > timeout:
                 raise Exception(f"Timeout waiting for {description} endstop")
                 
-            if endstop_obj.query_endstop(current_time):
+            # Use debounced check for reliable endstop detection
+            if self._debounced_endstop_check(endstop_obj):
                 return current_time - start_time
                 
             self.reactor.pause(0.1)  # Check every 100ms
